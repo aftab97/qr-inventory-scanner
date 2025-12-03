@@ -1,6 +1,5 @@
 import React, { useCallback, useState } from "react";
 import jsQR from "jsqr";
-import WebcamCapture from "./webcam-capture";
 import {
   enhanceContrast,
   unsharpMask,
@@ -8,22 +7,34 @@ import {
   invertImageData,
   binaryClose,
 } from "./image-processing";
+import WebcamCapture from "./webcam-capture";
 
 /**
- * QRScanner component
- * - receives ImageData from WebcamCapture
- * - runs multiple preprocessing strategies (fast -> heavier)
- * - tries jsQR for each strategy and reports first success via onResult prop
+ * Lightweight type for jsQR result (we only need `data`)
  */
-export default function QRScanner({ onResult }) {
-  const [lastStrategy, setLastStrategy] = useState("");
-  const [decoded, setDecoded] = useState(null);
+type JsQRResult = { data: string; location?: unknown } | null;
+
+type QRScannerProps = {
+  onResult?: (text: string) => void;
+};
+
+export default function QRScanner({ onResult }: QRScannerProps) {
+  const [lastStrategy, setLastStrategy] = useState<string>("");
+  const [decoded, setDecoded] = useState<string | null>(null);
+
+  // jsQR's runtime type isn't declared here reliably; coerce to a well-typed function
+  const jsqrDecode = (jsQR as unknown) as (
+    data: Uint8ClampedArray,
+    width: number,
+    height: number,
+    opts?: { inversionAttempts?: "dontInvert" | "attemptBoth" | string }
+  ) => JsQRResult;
 
   const handleScan = useCallback(
-    (imageData) => {
+    (imageData: ImageData | null) => {
       if (!imageData) return;
 
-      const strategies = [
+      const strategies: { name: string; fn: (id: ImageData) => ImageData }[] = [
         { name: "raw", fn: (id) => id },
         {
           name: "enhanced",
@@ -45,7 +56,8 @@ export default function QRScanner({ onResult }) {
         },
         {
           name: "adaptive-close",
-          fn: (id) => binaryClose(adaptiveThresholdBradley(new ImageData(new Uint8ClampedArray(id.data), id.width, id.height), 41, 0.12), 1),
+          fn: (id) =>
+            binaryClose(adaptiveThresholdBradley(new ImageData(new Uint8ClampedArray(id.data), id.width, id.height), 41, 0.12), 1),
         },
         {
           name: "invert-adaptive",
@@ -56,33 +68,34 @@ export default function QRScanner({ onResult }) {
       for (const strat of strategies) {
         try {
           const processed = strat.fn(imageData);
-          const code = jsQR(processed.data, processed.width, processed.height, { inversionAttempts: "dontInvert" });
-          if (code) {
-            setDecoded(code.data ?? code);
+          const code = jsqrDecode(processed.data, processed.width, processed.height, { inversionAttempts: "dontInvert" });
+          if (code && code.data) {
+            setDecoded(code.data);
             setLastStrategy(strat.name);
-            onResult?.(code.data ?? code);
+            onResult?.(code.data);
             return;
           }
         } catch (e) {
-          // strategy failed, try next
+          // strategy failed, continue to next
+          // keep console warning but don't use any 'any' in types
           // eslint-disable-next-line no-console
-          console.warn("Strategy failed", strat.name, e);
+          console.warn("Strategy failed", strat.name, e as unknown);
         }
       }
 
-      // fallback to jsQR attempts
+      // fallback to jsQR attempts with attemptBoth
       try {
-        const fb = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "attemptBoth" });
-        if (fb) {
-          setDecoded(fb.data ?? fb);
+        const fb = jsqrDecode(imageData.data, imageData.width, imageData.height, { inversionAttempts: "attemptBoth" });
+        if (fb && fb.data) {
+          setDecoded(fb.data);
           setLastStrategy("fallback-jsqr");
-          onResult?.(fb.data ?? fb);
+          onResult?.(fb.data);
         }
-      } catch (e) {
+      } catch {
         // ignore
       }
     },
-    [onResult]
+    [onResult, jsqrDecode]
   );
 
   return (

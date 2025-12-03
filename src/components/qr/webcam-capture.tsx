@@ -1,35 +1,52 @@
 import React, { useEffect, useRef, useState } from "react";
 import Webcam from "react-webcam";
 
+type WebcamCaptureProps = {
+  onScan?: (imageData: ImageData) => void;
+  interval?: number;
+};
+
 /**
- * Draws from the live video element to a hidden canvas to produce ImageData
- * and calls onScan(ImageData). Keeps resolution high for better decoding.
+ * Minimal typed subset of the react-webcam instance we use.
+ * react-webcam's instance exposes a `.video` element and a `getScreenshot` method.
+ * We only need `.video` here.
  */
-export default function WebcamCapture({ onScan, interval = 400 }) {
-  const webcamRef = useRef(null);
-  const canvasRef = useRef(null);
-  const [stream, setStream] = useState(null);
-  const [torchAvailable, setTorchAvailable] = useState(false);
-  const [torchOn, setTorchOn] = useState(false);
+type WebcamInstanceLike = {
+  video?: HTMLVideoElement | null;
+  getScreenshot?: (params?: { width?: number; height?: number }) => string | null;
+};
+
+export default function WebcamCapture({ onScan, interval = 400 }: WebcamCaptureProps) {
+  // we keep a narrow, explicit type for the component instance
+  const webcamRef = useRef<WebcamInstanceLike | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [torchAvailable, setTorchAvailable] = useState<boolean>(false);
+  const [torchOn, setTorchOn] = useState<boolean>(false);
 
   useEffect(() => {
-    const id = setInterval(() => {
+    const id = window.setInterval(() => {
       capture();
     }, interval);
-    return () => clearInterval(id);
+    return () => window.clearInterval(id);
+    // intentionally not depending on capture reference
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [webcamRef.current, interval, stream, torchOn]);
+  }, [interval, stream, torchOn]);
 
   useEffect(() => {
     const v = webcamRef.current?.video;
-    const s = v?.srcObject;
+    const s = v?.srcObject as MediaStream | undefined | null;
     if (!s) return;
-    const t = s.getVideoTracks?.()?.[0];
-    if (!t) { setTorchAvailable(false); return; }
+    const track = s.getVideoTracks?.()?.[0];
+    if (!track) {
+      setTorchAvailable(false);
+      return;
+    }
     try {
-      const caps = t.getCapabilities?.();
-      setTorchAvailable(Boolean(caps && (caps.torch || caps.torch === true)));
-    } catch (e) {
+      const caps = (track as MediaStreamTrack & { getCapabilities?: () => MediaTrackCapabilities }).getCapabilities?.();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      setTorchAvailable(Boolean(caps && (caps as any).torch)); // capability shape is not uniform across browsers
+    } catch {
       setTorchAvailable(false);
     }
   }, [stream]);
@@ -49,44 +66,57 @@ export default function WebcamCapture({ onScan, interval = 400 }) {
 
     // keep a reasonable maximum size so mobile CPU doesn't overwork
     const targetWidth = Math.min(vw, 1600);
-    const aspect = vh / vw;
-    const targetHeight = Math.round(targetWidth * aspect);
+    const aspect = vh / vw || 9 / 16;
+    const targetHeight = Math.max(1, Math.round(targetWidth * aspect));
 
     canvas.width = targetWidth;
     canvas.height = targetHeight;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
 
     try {
       ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
-    } catch (e) {
+    } catch {
+      // drawing may fail if video is not ready or something else went wrong
       return;
     }
 
-    let imageData;
+    let imageData: ImageData;
     try {
       imageData = ctx.getImageData(0, 0, targetWidth, targetHeight);
-    } catch (e) {
+    } catch {
       // if canvas is tainted for any reason, skip
       return;
     }
 
-    onScan?.(imageData);
+    if (onScan) onScan(imageData);
   };
 
   const toggleTorch = async () => {
     const video = webcamRef.current?.video;
-    const s = video?.srcObject;
+    const s = video?.srcObject as MediaStream | undefined | null;
     const track = s?.getVideoTracks?.()?.[0];
-    if (!track || !("applyConstraints" in track)) return;
+    if (!track || typeof track.applyConstraints !== "function") return;
     try {
+      // applyConstraints may fail on browsers that don't support torch
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      // @ts-ignore - browser-specific constraint shape
       await track.applyConstraints({ advanced: [{ torch: !torchOn }] });
       setTorchOn((v) => !v);
-    } catch (e) {
-      // ignore
+    } catch {
+      // ignore failures toggling torch
     }
   };
 
-  const videoConstraints = {
+  const handleUserMedia = (mediaStream: MediaStream) => {
+    setStream(mediaStream);
+    // also attempt to populate the webcamRef.video shortly after media stream is available
+    setTimeout(() => {
+      // no-op; the webcamRef will be populated by the ref callback below
+    }, 200);
+  };
+
+  const videoConstraints: MediaTrackConstraints = {
     width: { ideal: 1920 },
     height: { ideal: 1080 },
     facingMode: "environment",
@@ -95,21 +125,25 @@ export default function WebcamCapture({ onScan, interval = 400 }) {
   return (
     <div>
       <Webcam
-        ref={webcamRef}
+        // react-webcam's ref is an instance; we assign it to our typed ref via a callback
+        ref={(instance) => {
+          // instance is of unknown type in the library; coerce into our narrow interface
+          webcamRef.current = instance as unknown as WebcamInstanceLike | null;
+        }}
         audio={false}
         screenshotFormat="image/png"
         videoConstraints={videoConstraints}
-        onUserMedia={(s) => setStream(s)}
+        onUserMedia={handleUserMedia}
         mirrored={false}
         style={{ width: "100%", height: "auto", maxHeight: 480, background: "#000" }}
       />
       <div className="mt-2 flex gap-3">
         {torchAvailable && (
-          <button onClick={toggleTorch} className="flex-1 py-3 rounded-lg bg-yellow-500 text-black">
+          <button onClick={toggleTorch} className="flex-1 py-3 rounded-lg bg-yellow-500 text-black" type="button">
             {torchOn ? "Torch off" : "Torch on"}
           </button>
         )}
-        <button onClick={capture} className="flex-1 py-3 rounded-lg bg-blue-600 text-white">
+        <button onClick={capture} className="flex-1 py-3 rounded-lg bg-blue-600 text-white" type="button">
           Capture
         </button>
       </div>

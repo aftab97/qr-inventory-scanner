@@ -1,6 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // See earlier message for comments — small, fast helpers used server-side-ish in browser.
 
-export function enhanceContrast(imageData, contrast = 30) {
+export function enhanceContrast(imageData: any, contrast = 30) {
   const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
   const data = imageData.data;
   for (let i = 0; i < data.length; i += 4) {
@@ -11,7 +12,7 @@ export function enhanceContrast(imageData, contrast = 30) {
   return imageData;
 }
 
-export function unsharpMask(imageData, amount = 1.0) {
+export function unsharpMask(imageData: any, amount = 1.0) {
   const w = imageData.width;
   const h = imageData.height;
   const src = new Uint8ClampedArray(imageData.data);
@@ -44,7 +45,7 @@ export function unsharpMask(imageData, amount = 1.0) {
   return imageData;
 }
 
-export function invertImageData(imageData) {
+export function invertImageData(imageData: any) {
   const w = imageData.width;
   const h = imageData.height;
   const src = imageData.data;
@@ -58,7 +59,7 @@ export function invertImageData(imageData) {
   return out;
 }
 
-export function adaptiveThresholdBradley(srcImage, windowSize = 41, t = 0.15) {
+export function adaptiveThresholdBradley(srcImage: any, windowSize = 41, t = 0.15) {
   const w = srcImage.width, h = srcImage.height;
   const data = srcImage.data;
   const gray = new Uint32Array(w * h);
@@ -101,7 +102,7 @@ export function adaptiveThresholdBradley(srcImage, windowSize = 41, t = 0.15) {
   return out;
 }
 
-export function binaryClose(imageData, iterations = 1) {
+export function binaryClose(imageData: any, iterations = 1) {
   const w = imageData.width, h = imageData.height;
   const src = new Uint8ClampedArray((imageData.data.length / 4));
   for (let i = 0, p = 0; i < imageData.data.length; i += 4, p++) {
@@ -110,7 +111,7 @@ export function binaryClose(imageData, iterations = 1) {
 
   const tmp = new Uint8ClampedArray(src.length);
 
-  const dilate = (inArr, outArr) => {
+  const dilate = (inArr: any, outArr: any) => {
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         let on = 0;
@@ -127,7 +128,7 @@ export function binaryClose(imageData, iterations = 1) {
     }
   };
 
-  const erode = (inArr, outArr) => {
+  const erode = (inArr: any, outArr: any) => {
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         let all = 1;
@@ -159,6 +160,6 @@ export function binaryClose(imageData, iterations = 1) {
 }
 
 /* helpers */
-function clamp(v) { return v < 0 ? 0 : v > 255 ? 255 : v | 0; }
-function clampX(x, w) { if (x < 0) return 0; if (x >= w) return w - 1; return x; }
-function clampY(y, h) { if (y < 0) return 0; if (y >= h) return h - 1; return y; }
+function clamp(v: any) { return v < 0 ? 0 : v > 255 ? 255 : v | 0; }
+function clampX(x: any, w: any) { if (x < 0) return 0; if (x >= w) return w - 1; return x; }
+function clampY(y: any, h: any) { if (y < 0) return 0; if (y >= h) return h - 1; return y; }

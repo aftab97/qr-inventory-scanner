@@ -1,9 +1,10 @@
-import React, { useState } from "react";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import QRScanner from "../components/qr/qr-scanner";
 
 export default function Scan() {
-  const [lastDecoded, setLastDecoded] = useState(null);
+  const [lastDecoded, setLastDecoded] = useState<any>(null);
   const nav = useNavigate();
 
   return (

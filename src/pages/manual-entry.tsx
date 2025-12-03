@@ -1,11 +1,12 @@
-import React, { useState } from "react";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 export default function ManualEntry() {
   const [value, setValue] = useState("");
   const nav = useNavigate();
 
-  const submit = (e) => {
+  const submit = (e: any) => {
     e.preventDefault();
     // replace with real submit logic (API call / state update)
     console.log("Manual entry submitted:", value);

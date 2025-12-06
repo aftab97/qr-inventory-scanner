@@ -2,8 +2,8 @@ version: 1.0
 runtime: nodejs18
 
 build:
-  # Single shell command; chain steps with &&
-  command: npm ci && npm run build
+  # Single string; chain multiple steps with &&
+  commands: "npm ci && npm run build"
 
 run:
   command: node backend/index.js

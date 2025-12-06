@@ -2,8 +2,10 @@ version: 1.0
 runtime: nodejs18
 
 build:
-  # Single string; chain multiple steps with &&
-  commands: "npm ci && npm run build"
+  commands:
+    build: 
+      - npm ci 
+      - npm run build
 
 run:
   command: node backend/index.js
@@ -25,3 +27,10 @@ environment:
       value: "ID"
     - name: DYNAMO_SCHEMA_PREFIX
       value: "__meta__schema"
+
+health:
+  path: /health
+  interval: 10
+  timeout: 5
+  healthy_threshold: 3
+  unhealthy_threshold: 3

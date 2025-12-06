@@ -12,9 +12,7 @@ run:
   command: node backend/index.js
   network:
     port: 8080
-
-environment:
-  variables:
+  env:
     - name: NODE_ENV
       value: "production"
     - name: AWS_REGION

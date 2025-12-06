@@ -4,8 +4,7 @@ runtime: nodejs18
 build:
   commands:
     build: 
-      - npm ci 
-      - npm run build
+      - npm ci && npm run build
 
 run:
   command: node backend/index.js
@@ -14,23 +13,3 @@ run:
     env:
       - name: APP_PORT
         value: "8080"
-
-environment:
-  variables:
-    - name: NODE_ENV
-      value: "production"
-    - name: AWS_REGION
-      value: "us-east-1"
-    - name: DYNAMO_TABLE
-      value: "Jewelry_Boutique"
-    - name: DYNAMO_PK
-      value: "ID"
-    - name: DYNAMO_SCHEMA_PREFIX
-      value: "__meta__schema"
-
-health:
-  path: /health
-  interval: 10
-  timeout: 5
-  healthy_threshold: 3
-  unhealthy_threshold: 3

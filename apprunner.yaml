@@ -1,32 +1,10 @@
 version: 1.0
-
 build:
   runtime: container
   dockerfile:
-    # Path must be relative to the repo root and use the key 'path'
     path: Dockerfile
 
 run:
-  # Command must be a single string, not an array
   command: /usr/bin/supervisord -c /etc/supervisord.conf
-
-  # The port App Runner routes traffic to; must match nginx listen port
   network:
     port: 8080
-
-  # Health check keys must be camelCase and values within allowed ranges
-  healthCheck:
-    path: /
-    intervalSeconds: 10
-    timeoutSeconds: 5
-    healthyThreshold: 1
-    unhealthyThreshold: 3
-
-  # Environment variables are name/value pairs
-  environment:
-    - name: NODE_ENV
-      value: production
-    - name: PORT
-      value: "3000"
-    - name: APP_PORT
-      value: "8080"

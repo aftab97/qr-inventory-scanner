@@ -1,8 +1,21 @@
+/**
+ * Full backend server that:
+ * - Serves the built Vite React frontend from /dist
+ * - Exposes your existing API endpoints (categories, item patch, etc.)
+ * - Uses a single port compatible with AWS App Runner managed Node runtime
+ *
+ * Notes:
+ * - Build your frontend at repo root: `npm run build` produces ./dist
+ * - This server expects ./dist to exist at runtime
+ * - Frontend should call APIs with same-origin relative paths (e.g., "/categories", "/item/:id")
+ */
+
+const path = require('path');
 const express = require('express');
+const cors = require('cors');
 const multer = require('multer');
 const { parse } = require('csv-parse/sync');
 const XLSX = require('xlsx');
-const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
 const {
@@ -14,30 +27,45 @@ const {
 } = require('@aws-sdk/client-dynamodb');
 const { marshall, unmarshall } = require('@aws-sdk/util-dynamodb');
 
-const app = express();
-const port = process.env.PORT || 3000;
-const upload = multer({ storage: multer.memoryStorage() });
+// Environment
+const NODE_ENV = process.env.NODE_ENV || 'production';
+// App Runner injects the service port via APP_PORT (mapped from run.network.env in apprunner.yaml).
+// Fallback to PORT or 8080.
+const PORT = Number(process.env.APP_PORT || process.env.PORT || 8080);
 
-// Configuration via environment variables:
+// Dynamo/environment config (set via apprunner.yaml or App Runner console)
 const DYNAMO_TABLE = process.env.DYNAMO_TABLE || 'Jewelry_Boutique';
 const DYNAMO_PK = process.env.DYNAMO_PK || 'ID';
 const AWS_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
 const DYNAMO_SCHEMA_PREFIX = process.env.DYNAMO_SCHEMA_PREFIX || '__meta__schema';
 
-// Basic logging to help debug routing
-app.use((req, res, next) => {
+const app = express();
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Basic request logging
+app.use((req, _res, next) => {
   console.log(new Date().toISOString(), req.method, req.originalUrl);
   next();
 });
 
-app.use(cors({ origin: ['http://localhost:5173', 'http://127.0.0.1:5173'] }));
+// CORS: if frontend and backend are same-origin on App Runner, CORS isn't needed.
+// Keep it permissive for local dev or cross-origin setups.
+app.use(cors());
 app.use('/parse', express.text({ type: ['text/csv', 'text/plain'], limit: '50mb' }));
 app.use(express.json());
 
+// Serve static frontend built by Vite
+// Ensure `npm run build` in repo root creates ./dist before deployment
+const distPath = path.resolve(__dirname, '..', 'dist');
+app.use(express.static(distPath));
+
+// Health endpoint for App Runner
+app.get('/health', (_req, res) => res.json({ ok: true, env: NODE_ENV }));
+
+// Dynamo helpers
 function createDynamoClient() {
   return new DynamoDBClient({ region: AWS_REGION });
 }
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function batchWriteWithRetries(dynamo, requestItems, maxRetries = 5) {
@@ -76,7 +104,6 @@ async function scanAll(dynamo, params = {}) {
 }
 
 async function collectPrimaryKeys(dynamo, category = null) {
-  if (!dynamo) throw new Error('Dynamo client required');
   if (category == null) {
     const rows = await scanAll(dynamo, { ProjectionExpression: DYNAMO_PK });
     return rows.map((r) => r[DYNAMO_PK]).filter(Boolean);
@@ -107,7 +134,6 @@ async function deleteAllItems(dynamo, category = null) {
 }
 
 async function putItems(dynamo, items) {
-  if (!dynamo) throw new Error('Dynamo client required');
   let writtenCount = 0;
   for (let i = 0; i < items.length; i += 25) {
     const chunk = items.slice(i, i + 25);
@@ -227,6 +253,8 @@ function buildItemsForDataset(rows, headerOriginalOrder, category) {
   return { items, missing, schemaItem, headerOriginalOrder: sanitizedHeaders, headerNormalizedOrder, warnings };
 }
 
+// API routes
+
 function parseCategoriesField(req) {
   if (req.body && typeof req.body.categories === 'string') {
     try {
@@ -237,7 +265,7 @@ function parseCategoriesField(req) {
   return {};
 }
 
-// Main parse endpoint (preview/apply)
+// POST /parse — preview/apply uploads
 app.post('/parse', upload.single('file'), async (req, res) => {
   try {
     let buffer = null; let text = null; let parseType = null;
@@ -313,7 +341,19 @@ app.post('/parse', upload.single('file'), async (req, res) => {
     }
 
     if (!replaceMode && !updateMode) {
-      return res.json({ type: parseType, datasets: allWork.map((w) => ({ sheetName: w.sheetName, category: w.category, headerOriginalOrder: w.headerOriginalOrder, headerNormalizedOrder: w.headerNormalizedOrder, rows: Math.max(0, w.items.length), warnings: w.warnings || [], defaultSelectedColumn: 'Total' })), note: 'Preview returned. To apply, POST again with ?update=true or ?replace=true and optionally categories mapping.' });
+      return res.json({
+        type: parseType,
+        datasets: allWork.map((w) => ({
+          sheetName: w.sheetName,
+          category: w.category,
+          headerOriginalOrder: w.headerOriginalOrder,
+          headerNormalizedOrder: w.headerNormalizedOrder,
+          rows: Math.max(0, w.items.length),
+          warnings: w.warnings || [],
+          defaultSelectedColumn: 'Total',
+        })),
+        note: 'Preview returned. To apply, POST again with ?update=true or ?replace=true and optionally categories mapping.',
+      });
     }
 
     const dynamo = createDynamoClient();
@@ -324,9 +364,27 @@ app.post('/parse', upload.single('file'), async (req, res) => {
         if (replaceMode) {
           const existingKeys = await collectPrimaryKeys(dynamo, work.category);
           const deleteCount = existingKeys.length;
-          previews.push({ sheetName: work.sheetName, category: work.category, deleteCount, deletePreview: existingKeys.slice(0, 200), putCount: work.items.length, putPreview: work.items.slice(0, 200), schemaItemPreview: work.schemaItem, warnings: work.warnings || [], defaultSelectedColumn: 'Total' });
+          previews.push({
+            sheetName: work.sheetName,
+            category: work.category,
+            deleteCount,
+            deletePreview: existingKeys.slice(0, 200),
+            putCount: work.items.length,
+            putPreview: work.items.slice(0, 200),
+            schemaItemPreview: work.schemaItem,
+            warnings: work.warnings || [],
+            defaultSelectedColumn: 'Total',
+          });
         } else {
-          previews.push({ sheetName: work.sheetName, category: work.category, putCount: work.items.length, putPreview: work.items.slice(0, 200), schemaItemPreview: work.schemaItem, warnings: work.warnings || [], defaultSelectedColumn: 'Total' });
+          previews.push({
+            sheetName: work.sheetName,
+            category: work.category,
+            putCount: work.items.length,
+            putPreview: work.items.slice(0, 200),
+            schemaItemPreview: work.schemaItem,
+            warnings: work.warnings || [],
+            defaultSelectedColumn: 'Total',
+          });
         }
       }
       return res.json({ mode: replaceMode ? 'replace' : 'update', dry: true, previews });
@@ -433,7 +491,7 @@ app.get('/columns', async (req, res) => {
   }
 });
 
-// Get items for a category (excludes schema)
+// GET /category/:name — items and schema for a category
 app.get('/category/:name', async (req, res) => {
   try {
     const dynamo = createDynamoClient();
@@ -443,7 +501,13 @@ app.get('/category/:name', async (req, res) => {
     const items = [];
     let ExclusiveStartKey = undefined;
     do {
-      const params = { TableName: DYNAMO_TABLE, FilterExpression: '#c = :cat', ExpressionAttributeNames: { '#c': 'category' }, ExpressionAttributeValues: marshall({ ':cat': category }), ExclusiveStartKey };
+      const params = {
+        TableName: DYNAMO_TABLE,
+        FilterExpression: '#c = :cat',
+        ExpressionAttributeNames: { '#c': 'category' },
+        ExpressionAttributeValues: marshall({ ':cat': category }),
+        ExclusiveStartKey,
+      };
       const cmd = new ScanCommand(params);
       const resp = await dynamo.send(cmd);
       const raw = resp.Items || [];
@@ -461,16 +525,17 @@ app.get('/category/:name', async (req, res) => {
 
     return res.json({ category, schema, items });
   } catch (err) {
-    console.error('GET /category/:name error', err); res.status(500).json({ error: 'Failed to get category items', details: String(err) });
+    console.error('GET /category/:name error', err);
+    res.status(500).json({ error: 'Failed to get category items', details: String(err) });
   }
 });
 
-// Helpers for schema-aware PATCH
+// Helper: fetch item by ID (excluding schema items)
 async function getItemById(dynamo, id) {
   const all = await scanAll(dynamo, {});
   for (const it of all) {
     const pkVal = it[DYNAMO_PK];
-    if (typeof pkVal === "string" && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)) continue;
+    if (typeof pkVal === 'string' && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)) continue;
     if (pkVal === id) return it;
   }
   return null;
@@ -481,7 +546,7 @@ async function getSchemaForCategory(dynamo, category) {
 }
 function norm(str) { return String(str || "").trim().toLowerCase(); }
 
-// PATCH item attribute — enforce column exists in category schema
+// PATCH /item/:id — schema-aware attribute update
 app.patch('/item/:id', async (req, res) => {
   try {
     const dynamo = createDynamoClient();
@@ -491,7 +556,6 @@ app.patch('/item/:id', async (req, res) => {
     const { attribute, value, category: bodyCategory } = req.body || {};
     if (!attribute) return res.status(400).json({ error: 'Missing attribute in body' });
 
-    // 1) Load item
     const item = await getItemById(dynamo, id);
     if (!item) return res.status(404).json({ error: 'Item not found' });
 
@@ -500,7 +564,6 @@ app.patch('/item/:id', async (req, res) => {
       return res.status(400).json({ error: 'Item category unknown; cannot validate attribute' });
     }
 
-    // 2) Load schema for category
     const schemaItem = await getSchemaForCategory(dynamo, effectiveCategory);
     if (!schemaItem) {
       return res.status(400).json({ error: `Schema not found for category "${effectiveCategory}"` });
@@ -513,8 +576,6 @@ app.patch('/item/:id', async (req, res) => {
       : [];
 
     const attrNorm = norm(attribute);
-
-    // 3) Validate attribute exists in schema
     if (!headerNorm.includes(attrNorm)) {
       return res.status(400).json({
         error: 'Attribute not allowed for this category',
@@ -523,7 +584,6 @@ app.patch('/item/:id', async (req, res) => {
       });
     }
 
-    // 4) Update with category condition
     const Key = marshall({ [DYNAMO_PK]: id });
     const ExpressionAttributeNames = { '#attr': attribute, '#cat': 'category' };
     const marshalledVals = marshall({ ':val': value, ':cat': effectiveCategory });
@@ -556,7 +616,7 @@ app.patch('/item/:id', async (req, res) => {
   }
 });
 
-// DELETE single item
+// DELETE /item/:id — delete single item
 app.delete('/item/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -572,6 +632,16 @@ app.delete('/item/:id', async (req, res) => {
     return res.status(500).json({ error: 'Failed to delete item', details: String(err) });
   }
 });
+
+// Category and column delete, export routes can be added similarly, if needed.
+
+// SPA fallback (serve index.html for non-API routes)
+app.get('*', (req, res, next) => {
+  const apiPrefixes = ['/parse', '/categories', '/category', '/item', '/health'];
+  if (apiPrefixes.some((p) => req.path.startsWith(p))) return next();
+  res.sendFile(path.join(distPath, 'index.html'));
+});
+
 
 // DELETE category
 app.delete('/category/:name', async (req, res) => {
@@ -799,12 +869,13 @@ app.get('/export/all', async (req, res) => {
   } catch (err) {
     console.error('Export all error', err); res.status(500).json({ error: 'Failed to export all categories', details: String(err) });
   }
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+  console.log('ENV:', { NODE_ENV, PORT, DYNAMO_TABLE, DYNAMO_PK, AWS_REGION, DYNAMO_SCHEMA_PREFIX });
 });
 
-app.listen(port, () => {
-  console.log(`CSV/XLSX app listening at http://localhost:${port}`);
-  console.log('ENV:', { DYNAMO_TABLE, DYNAMO_PK, AWS_REGION, DYNAMO_SCHEMA_PREFIX });
-});
-
+// Process-level error handlers
 process.on('unhandledRejection', (reason) => { console.error('Unhandled Rejection:', reason); });
 process.on('uncaughtException', (err) => { console.error('Uncaught Exception:', err); process.exit(1); });

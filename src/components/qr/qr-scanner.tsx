@@ -1,4 +1,4 @@
-import  { useCallback, useState } from "react";
+import React, { useCallback, useRef, useState, forwardRef, useImperativeHandle } from "react";
 import jsQR from "jsqr";
 import {
   enhanceContrast,
@@ -7,28 +7,49 @@ import {
   invertImageData,
   binaryClose,
 } from "./image-processing";
-import WebcamCapture from "./webcam-capture";
+import WebcamCapture, { type WebcamCaptureHandle } from "./webcam-capture";
 
-/**
- * Lightweight type for jsQR result (we only need `data`)
- */
 type JsQRResult = { data: string; location?: unknown } | null;
 
 type QRScannerProps = {
   onResult?: (text: string) => void;
+  onStop?: () => void; // notify parent when scanning stops
 };
 
-export default function QRScanner({ onResult }: QRScannerProps) {
+export type QRScannerHandle = {
+  stop: () => void;
+};
+
+const QRScanner = forwardRef<QRScannerHandle, QRScannerProps>(function QRScanner({ onResult, onStop }, ref) {
   const [lastStrategy, setLastStrategy] = useState<string>("");
   const [decoded, setDecoded] = useState<string | null>(null);
+  const webcamRef = useRef<WebcamCaptureHandle | null>(null);
 
-  // jsQR's runtime type isn't declared here reliably; coerce to a well-typed function
+  // jsQR typed facade
   const jsqrDecode = (jsQR as unknown) as (
     data: Uint8ClampedArray,
     width: number,
     height: number,
     opts?: { inversionAttempts?: "dontInvert" | "attemptBoth" | string }
   ) => JsQRResult;
+
+  useImperativeHandle(ref, () => ({
+    stop: () => {
+      try {
+        webcamRef.current?.stop();
+        onStop?.();
+      } catch {
+        // ignore
+      }
+    },
+  }));
+
+  const stopScanning = useCallback(() => {
+    try {
+      webcamRef.current?.stop();
+    } catch {}
+    onStop?.();
+  }, [onStop]);
 
   const handleScan = useCallback(
     (imageData: ImageData | null) => {
@@ -65,6 +86,7 @@ export default function QRScanner({ onResult }: QRScannerProps) {
         },
       ];
 
+      // Try strategies; if any decodes, stop scanning immediately
       for (const strat of strategies) {
         try {
           const processed = strat.fn(imageData);
@@ -73,29 +95,30 @@ export default function QRScanner({ onResult }: QRScannerProps) {
             setDecoded(code.data);
             setLastStrategy(strat.name);
             onResult?.(code.data);
+            // IMPORTANT: stop the webcam immediately after a decode
+            stopScanning();
             return;
           }
         } catch (e) {
-          // strategy failed, continue to next
-          // keep console warning but don't use any 'any' in types
           // eslint-disable-next-line no-console
           console.warn("Strategy failed", strat.name, e as unknown);
         }
       }
 
-      // fallback to jsQR attempts with attemptBoth
+      // fallback attemptBoth
       try {
         const fb = jsqrDecode(imageData.data, imageData.width, imageData.height, { inversionAttempts: "attemptBoth" });
         if (fb && fb.data) {
           setDecoded(fb.data);
           setLastStrategy("fallback-jsqr");
           onResult?.(fb.data);
+          stopScanning();
         }
       } catch {
         // ignore
       }
     },
-    [onResult, jsqrDecode]
+    [onResult, jsqrDecode, stopScanning]
   );
 
   return (
@@ -109,8 +132,10 @@ export default function QRScanner({ onResult }: QRScannerProps) {
       </div>
 
       <div className="rounded-lg overflow-hidden">
-        <WebcamCapture onScan={handleScan} interval={450} />
+        <WebcamCapture ref={webcamRef} onScan={handleScan} interval={450} />
       </div>
     </div>
   );
-}
+});
+
+export default QRScanner;

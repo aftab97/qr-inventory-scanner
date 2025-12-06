@@ -1,38 +1,61 @@
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } from "react";
 import Webcam from "react-webcam";
 
 type WebcamCaptureProps = {
   onScan?: (imageData: ImageData) => void;
-  interval?: number;
+  interval?: number; // ms
 };
 
-/**
- * Minimal typed subset of the react-webcam instance we use.
- * react-webcam's instance exposes a `.video` element and a `getScreenshot` method.
- * We only need `.video` here.
- */
+export type WebcamCaptureHandle = {
+  stop: () => void;
+};
+
 type WebcamInstanceLike = {
   video?: HTMLVideoElement | null;
-  getScreenshot?: (params?: { width?: number; height?: number }) => string | null;
 };
 
-export default function WebcamCapture({ onScan, interval = 400 }: WebcamCaptureProps) {
-  // we keep a narrow, explicit type for the component instance
+const WebcamCapture = forwardRef<WebcamCaptureHandle, WebcamCaptureProps>(function WebcamCapture(
+  { onScan, interval = 400 },
+  ref
+) {
   const webcamRef = useRef<WebcamInstanceLike | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
+  const [timerId, setTimerId] = useState<number | null>(null);
   const [torchAvailable, setTorchAvailable] = useState<boolean>(false);
   const [torchOn, setTorchOn] = useState<boolean>(false);
 
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      capture();
-    }, interval);
-    return () => window.clearInterval(id);
-    // intentionally not depending on capture reference
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [interval, stream, torchOn]);
+  useImperativeHandle(ref, () => ({
+    stop: () => {
+      // stop interval
+      if (timerId) {
+        window.clearInterval(timerId);
+        setTimerId(null);
+      }
+      // stop media tracks
+      try {
+        const v = webcamRef.current?.video;
+        const s = v?.srcObject as MediaStream | undefined | null;
+        s?.getTracks()?.forEach((t) => t.stop());
+      } catch {
+        // ignore
+      }
+    },
+  }));
 
+  useEffect(() => {
+    // start periodic capture when stream becomes available
+    if (!stream || timerId) return;
+    const id = window.setInterval(() => capture(), interval);
+    setTimerId(id as unknown as number);
+    return () => {
+      window.clearInterval(id);
+      setTimerId(null);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stream, interval]);
+
+  // detect torch support
   useEffect(() => {
     const v = webcamRef.current?.video;
     const s = v?.srcObject as MediaStream | undefined | null;
@@ -45,7 +68,7 @@ export default function WebcamCapture({ onScan, interval = 400 }: WebcamCaptureP
     try {
       const caps = (track as MediaStreamTrack & { getCapabilities?: () => MediaTrackCapabilities }).getCapabilities?.();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      setTorchAvailable(Boolean(caps && (caps as any).torch)); // capability shape is not uniform across browsers
+      setTorchAvailable(Boolean(caps && (caps as any).torch));
     } catch {
       setTorchAvailable(false);
     }
@@ -64,7 +87,6 @@ export default function WebcamCapture({ onScan, interval = 400 }: WebcamCaptureP
     const vw = video.videoWidth || 1280;
     const vh = video.videoHeight || 720;
 
-    // keep a reasonable maximum size so mobile CPU doesn't overwork
     const targetWidth = Math.min(vw, 1600);
     const aspect = vh / vw || 9 / 16;
     const targetHeight = Math.max(1, Math.round(targetWidth * aspect));
@@ -77,7 +99,6 @@ export default function WebcamCapture({ onScan, interval = 400 }: WebcamCaptureP
     try {
       ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
     } catch {
-      // drawing may fail if video is not ready or something else went wrong
       return;
     }
 
@@ -85,7 +106,6 @@ export default function WebcamCapture({ onScan, interval = 400 }: WebcamCaptureP
     try {
       imageData = ctx.getImageData(0, 0, targetWidth, targetHeight);
     } catch {
-      // if canvas is tainted for any reason, skip
       return;
     }
 
@@ -98,22 +118,17 @@ export default function WebcamCapture({ onScan, interval = 400 }: WebcamCaptureP
     const track = s?.getVideoTracks?.()?.[0];
     if (!track || typeof track.applyConstraints !== "function") return;
     try {
-      // applyConstraints may fail on browsers that don't support torch
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-ignore - browser-specific constraint shape
+      // @ts-ignore
       await track.applyConstraints({ advanced: [{ torch: !torchOn }] });
       setTorchOn((v) => !v);
     } catch {
-      // ignore failures toggling torch
+      // ignore
     }
   };
 
   const handleUserMedia = (mediaStream: MediaStream) => {
     setStream(mediaStream);
-    // also attempt to populate the webcamRef.video shortly after media stream is available
-    setTimeout(() => {
-      // no-op; the webcamRef will be populated by the ref callback below
-    }, 200);
   };
 
   const videoConstraints: MediaTrackConstraints = {
@@ -125,9 +140,7 @@ export default function WebcamCapture({ onScan, interval = 400 }: WebcamCaptureP
   return (
     <div>
       <Webcam
-        // react-webcam's ref is an instance; we assign it to our typed ref via a callback
         ref={(instance) => {
-          // instance is of unknown type in the library; coerce into our narrow interface
           webcamRef.current = instance as unknown as WebcamInstanceLike | null;
         }}
         audio={false}
@@ -143,10 +156,10 @@ export default function WebcamCapture({ onScan, interval = 400 }: WebcamCaptureP
             {torchOn ? "Torch off" : "Torch on"}
           </button>
         )}
-        <button onClick={capture} className="flex-1 py-3 rounded-lg bg-blue-600 text-white" type="button">
-          Capture
-        </button>
+        {/* No manual capture button — auto-capturing via interval */}
       </div>
     </div>
   );
-}
+});
+
+export default WebcamCapture;

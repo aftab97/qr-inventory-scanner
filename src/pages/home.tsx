@@ -1,9 +1,10 @@
+import React from "react";
 import { useNavigate } from "react-router-dom";
 
 export default function Home() {
   const nav = useNavigate();
   return (
-    <div className="app-container">
+    <div className="app-container max-w-3xl mx-auto px-4">
       <header className="flex items-center justify-center mt-8 mb-10">
         <h1 className="text-2xl font-semibold">QR Inventory</h1>
       </header>
@@ -15,6 +16,8 @@ export default function Home() {
           <button
             onClick={() => nav("/scan")}
             className="w-full py-4 rounded-lg bg-blue-600 text-white text-lg font-medium shadow hover:bg-blue-700 focus:outline-none"
+            aria-label="Scan item"
+            type="button"
           >
             Scan item
           </button>
@@ -22,8 +25,37 @@ export default function Home() {
           <button
             onClick={() => nav("/manual")}
             className="w-full mt-4 py-4 rounded-lg bg-gray-200 text-gray-800 text-lg font-medium hover:bg-gray-300 focus:outline-none"
+            aria-label="Enter item manually"
+            type="button"
           >
             Enter item manually
+          </button>
+
+          <button
+            onClick={() => nav("/viewer")}
+            className="w-full mt-4 py-4 rounded-lg bg-green-600 text-white text-lg font-medium shadow hover:bg-green-700 focus:outline-none"
+            aria-label="View inventory"
+            type="button"
+          >
+            View inventory
+          </button>
+
+          <button
+            onClick={() => nav("/csv")}
+            className="w-full mt-4 py-4 rounded-lg bg-indigo-600 text-white text-lg font-medium shadow hover:bg-indigo-700 focus:outline-none"
+            aria-label="Add inventory (via Excel)"
+            type="button"
+          >
+            Add inventory (via Excel)
+          </button>
+
+          <button
+            onClick={() => nav("/charts")}
+            className="w-full mt-4 py-4 rounded-lg bg-green-600 text-white text-lg font-medium shadow hover:bg-green-700 focus:outline-none"
+            aria-label="View inventory"
+            type="button"
+          >
+            View inventory (Charts)
           </button>
         </div>
 

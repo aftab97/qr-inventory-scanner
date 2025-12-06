@@ -11,3 +11,9 @@ run:
   network:
     port: 8080
 
+health:
+  path: /health
+  interval: 10
+  timeout: 5
+  healthy_threshold: 3
+  unhealthy_threshold: 3

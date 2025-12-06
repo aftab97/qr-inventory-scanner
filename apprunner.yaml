@@ -1,20 +1,10 @@
-# App Runner configuration using Managed Runtime for Node.js
-# It builds the React app at repo root, then runs backend/index.js serving ./dist.
-# Environment variables are customizable in the App Runner console or here.
-
 version: 1.0
 runtime: nodejs18
 
-# Commands execute in the repository root
 build:
-  # Ensure clean install and build vite output into ./dist
-  # If you use npm workspaces, adapt the install step accordingly.
-  commands:
-    - npm ci
-    - npm run build
+  # Single shell command; chain steps with &&
+  command: npm ci && npm run build
 
-# Start the express backend which serves ../dist static files via path.resolve(__dirname, '..', 'dist')
-# Your backend's PORT is read from APP_PORT (provided by App Runner), falling back to PORT or 8080.
 run:
   command: node backend/index.js
   network:
@@ -23,9 +13,6 @@ run:
       - name: APP_PORT
         value: "8080"
 
-# Environment variables for DynamoDB and AWS Region.
-# You can also set these in the App Runner console instead of hardcoding values.
-# If you set here, commit-safe values only (no secrets).
 environment:
   variables:
     - name: NODE_ENV

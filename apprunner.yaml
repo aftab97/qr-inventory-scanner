@@ -1,0 +1,36 @@
+version: 1.0
+# Tell App Runner to build from a Dockerfile located at the repo root
+# If your Dockerfile has a different name or path, change 'path' accordingly.
+build:
+  runtime: container
+  dockerfile:
+    path: ./Dockerfile
+
+# Runtime configuration for the service
+# App Runner will route traffic to the container on this port.
+# Our nginx is configured to listen on 8080 in the provided Dockerfile.
+run:
+  command: ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
+  network:
+    port: 8080
+  healthCheck:
+    path: /
+    intervalSeconds: 10
+    timeoutSeconds: 5
+    healthyThreshold: 1
+    unhealthyThreshold: 3
+  environment:
+    # App Runner will inject these environment variables into the container
+    # You can add AWS-specific variables (e.g., AWS_REGION, DYNAMO_TABLE) here
+    - name: NODE_ENV
+      value: production
+    - name: PORT
+      value: "3000"
+    - name: APP_PORT
+      value: "8080"
+
+# Optional auto-scaling settings (defaults are usually fine)
+# autoscaling:
+#   maxConcurrency: 100
+#   maxSize: 25
+#   minSize: 1

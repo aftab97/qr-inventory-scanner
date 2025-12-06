@@ -12,3 +12,18 @@ run:
   command: node backend/index.js
   network:
     port: 8080
+
+environment:
+  variables:
+    - name: NODE_ENV
+      value: "production"
+    - name: AWS_REGION
+      value: "us-east-1"
+    - name: DYNAMO_TABLE
+      value: "Jewelry_Boutique"
+    - name: DYNAMO_PK
+      value: "ID"
+    - name: DYNAMO_SCHEMA_PREFIX
+      value: "__meta__schema"
+    - name: PORT
+      value: "8080"

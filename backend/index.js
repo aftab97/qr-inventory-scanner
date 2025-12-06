@@ -15,7 +15,14 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const { parse } = require('csv-parse/sync');
+// csv-parse v6 is ESM; use dynamic import to stay compatible with CommonJS here
+let parseCsvSync = null;
+async function getParseCsv() {
+  if (parseCsvSync) return parseCsvSync;
+  const mod = await import('csv-parse/sync');
+  parseCsvSync = mod.parse || mod.default || mod;
+  return parseCsvSync;
+}
 const XLSX = require('xlsx');
 const { v4: uuidv4 } = require('uuid');
 
@@ -30,7 +37,7 @@ const { marshall, unmarshall } = require('@aws-sdk/util-dynamodb');
 
 // Environment
 const NODE_ENV = process.env.NODE_ENV || 'production';
-// Prefer PORT (explicitly set in apprunner.yaml), then APP_PORT, else 8080
+// Prefer PORT (explicitly set in App Runner env), then APP_PORT, else 8080
 const PORT = Number(process.env.PORT || process.env.APP_PORT || 8080);
 
 // Dynamo/environment config (set via apprunner.yaml or App Runner console)
@@ -309,6 +316,7 @@ app.post('/parse', upload.single('file'), async (req, res) => {
     }
 
     if (!datasets.length && text != null) {
+      const parse = await getParseCsv();
       const records = parse(text, { columns: true, skip_empty_lines: true, trim: false });
       if (!Array.isArray(records) || records.length === 0) return res.status(400).json({ error: 'No rows found in provided CSV' });
       if (!providedCategory && !(req.body && req.body.categories)) return res.status(400).json({ error: 'CSV upload requires category.' });
@@ -667,12 +675,7 @@ app.delete('/category/:name/column/:columnName', async (req, res) => {
     if (!category || !rawColumnName) return res.status(400).json({ error: 'Missing category or column name' });
     if (["nom","nombre","pierres","piedras"].includes(String(rawColumnName).trim().toLowerCase())) return res.status(403).json({ error: 'Protected column' });
 
-    const rows = await scanAll(dynamo, {
-      FilterExpression: '#c = :cat',
-      ExpressionAttributeNames: { '#c': 'category' },
-      ExpressionAttributeValues: marshall({ ':cat': category }),
-      ProjectionExpression: `${DYNAMO_PK}`
-    });
+    const rows = await scanAll(dynamo, { FilterExpression: '#c = :cat', ExpressionAttributeNames: { '#c': 'category' }, ExpressionAttributeValues: marshall({ ':cat': category }), ProjectionExpression: `${DYNAMO_PK}` });
 
     let removedCount = 0;
     for (const r of rows) {
@@ -680,13 +683,7 @@ app.delete('/category/:name/column/:columnName', async (req, res) => {
       if (typeof pkVal === 'string' && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)) continue;
       try {
         const Key = marshall({ [DYNAMO_PK]: pkVal });
-        const params = {
-          TableName: DYNAMO_TABLE,
-          Key,
-          UpdateExpression: `REMOVE #attr`,
-          ExpressionAttributeNames: { '#attr': rawColumnName },
-          ReturnValues: 'ALL_OLD'
-        };
+        const params = { TableName: DYNAMO_TABLE, Key, UpdateExpression: `REMOVE #attr`, ExpressionAttributeNames: { '#attr': rawColumnName }, ReturnValues: 'ALL_OLD' };
         const cmd = new UpdateItemCommand(params);
         await dynamo.send(cmd);
         removedCount++;
@@ -707,31 +704,13 @@ app.delete('/category/:name/column/:columnName', async (req, res) => {
       for (let i = 0; i < hdrOrig.length; i++) {
         const o = hdrOrig[i];
         const n = hdrNorm[i] || (typeof o === 'string' ? o.toLowerCase() : '');
-        if (String(o).trim() === String(rawColumnName).trim()) {
-          // skip
-        } else if (String(n).trim() === String(rawColumnName).trim().toLowerCase()) {
-          // skip
-        } else {
-          filteredOrig.push(o); filteredNorm.push(n);
-        }
+        if (String(o).trim() === String(rawColumnName).trim()) { } else if (String(n).trim() === String(rawColumnName).trim().toLowerCase()) { } else { filteredOrig.push(o); filteredNorm.push(n); }
       }
       if (filteredOrig.length !== hdrOrig.length || filteredNorm.length !== hdrNorm.length) {
         const Key = marshall({ [DYNAMO_PK]: schemaPk });
         const exprVals = marshall({ ':h': filteredOrig, ':n': filteredNorm, ':u': new Date().toISOString() });
-        const params = {
-          TableName: DYNAMO_TABLE,
-          Key,
-          UpdateExpression: 'SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u',
-          ExpressionAttributeValues: exprVals,
-          ReturnValues: 'ALL_NEW'
-        };
-        try {
-          const cmd = new UpdateItemCommand(params);
-          await dynamo.send(cmd);
-          updatedSchema = true;
-        } catch (err) {
-          console.error('Failed to update schema item:', schemaPk, err);
-        }
+        const params = { TableName: DYNAMO_TABLE, Key, UpdateExpression: 'SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u', ExpressionAttributeValues: exprVals, ReturnValues: 'ALL_NEW' };
+        try { const cmd = new UpdateItemCommand(params); await dynamo.send(cmd); updatedSchema = true; } catch (err) { console.error('Failed to update schema item:', schemaPk, err); }
       }
     }
 
@@ -752,12 +731,7 @@ app.delete('/category/:name/column', async (req, res) => {
     if (!category || !rawColumnName) return res.status(400).json({ error: 'Missing category or column name in body' });
     if (["nom","nombre","pierres","piedras"].includes(String(rawColumnName).trim().toLowerCase())) return res.status(403).json({ error: 'Protected column' });
 
-    const rows = await scanAll(dynamo, {
-      FilterExpression: '#c = :cat',
-      ExpressionAttributeNames: { '#c': 'category' },
-      ExpressionAttributeValues: marshall({ ':cat': category }),
-      ProjectionExpression: `${DYNAMO_PK}`
-    });
+    const rows = await scanAll(dynamo, { FilterExpression: '#c = :cat', ExpressionAttributeNames: { '#c': 'category' }, ExpressionAttributeValues: marshall({ ':cat': category }), ProjectionExpression: `${DYNAMO_PK}` });
 
     let removedCount = 0;
     for (const r of rows) {
@@ -765,13 +739,7 @@ app.delete('/category/:name/column', async (req, res) => {
       if (typeof pkVal === 'string' && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)) continue;
       try {
         const Key = marshall({ [DYNAMO_PK]: pkVal });
-        const params = {
-          TableName: DYNAMO_TABLE,
-          Key,
-          UpdateExpression: `REMOVE #attr`,
-          ExpressionAttributeNames: { '#attr': rawColumnName },
-          ReturnValues: 'ALL_OLD'
-        };
+        const params = { TableName: DYNAMO_TABLE, Key, UpdateExpression: `REMOVE #attr`, ExpressionAttributeNames: { '#attr': rawColumnName }, ReturnValues: 'ALL_OLD' };
         const cmd = new UpdateItemCommand(params);
         await dynamo.send(cmd);
         removedCount++;
@@ -792,31 +760,13 @@ app.delete('/category/:name/column', async (req, res) => {
       for (let i = 0; i < hdrOrig.length; i++) {
         const o = hdrOrig[i];
         const n = hdrNorm[i] || (typeof o === 'string' ? o.toLowerCase() : '');
-        if (String(o).trim() === String(rawColumnName).trim()) {
-          // skip
-        } else if (String(n).trim() === String(rawColumnName).trim().toLowerCase()) {
-          // skip
-        } else {
-          filteredOrig.push(o); filteredNorm.push(n);
-        }
+        if (String(o).trim() === String(rawColumnName).trim()) { } else if (String(n).trim() === String(rawColumnName).trim().toLowerCase()) { } else { filteredOrig.push(o); filteredNorm.push(n); }
       }
       if (filteredOrig.length !== hdrOrig.length || filteredNorm.length !== hdrNorm.length) {
         const Key = marshall({ [DYNAMO_PK]: schemaPk });
         const exprVals = marshall({ ':h': filteredOrig, ':n': filteredNorm, ':u': new Date().toISOString() });
-        const params = {
-          TableName: DYNAMO_TABLE,
-          Key,
-          UpdateExpression: 'SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u',
-          ExpressionAttributeValues: exprVals,
-          ReturnValues: 'ALL_NEW'
-        };
-        try {
-          const cmd = new UpdateItemCommand(params);
-          await dynamo.send(cmd);
-          updatedSchema = true;
-        } catch (err) {
-          console.error('Failed to update schema item:', schemaPk, err);
-        }
+        const params = { TableName: DYNAMO_TABLE, Key, UpdateExpression: 'SET headerOriginalOrder = :h, headerNormalizedOrder = :n, updatedAt = :u', ExpressionAttributeValues: exprVals, ReturnValues: 'ALL_NEW' };
+        try { const cmd = new UpdateItemCommand(params); await dynamo.send(cmd); updatedSchema = true; } catch (err) { console.error('Failed to update schema item:', schemaPk, err); }
       }
     }
 
@@ -838,13 +788,7 @@ app.get('/export/category/:name', async (req, res) => {
     const items = [];
     let ExclusiveStartKey = undefined;
     do {
-      const params = {
-        TableName: DYNAMO_TABLE,
-        FilterExpression: '#c = :cat',
-        ExpressionAttributeNames: { '#c': 'category' },
-        ExpressionAttributeValues: marshall({ ':cat': category }),
-        ExclusiveStartKey
-      };
+      const params = { TableName: DYNAMO_TABLE, FilterExpression: '#c = :cat', ExpressionAttributeNames: { '#c': 'category' }, ExpressionAttributeValues: marshall({ ':cat': category }), ExclusiveStartKey };
       const cmd = new ScanCommand(params);
       const resp = await dynamo.send(cmd);
       const raw = resp.Items || [];
@@ -900,13 +844,7 @@ app.get('/export/all', async (_req, res) => {
       const items = [];
       let ExclusiveStartKey = undefined;
       do {
-        const params = {
-          TableName: DYNAMO_TABLE,
-          FilterExpression: '#c = :cat',
-          ExpressionAttributeNames: { '#c': 'category' },
-          ExpressionAttributeValues: marshall({ ':cat': category }),
-          ExclusiveStartKey
-        };
+        const params = { TableName: DYNAMO_TABLE, FilterExpression: '#c = :cat', ExpressionAttributeNames: { '#c': 'category' }, ExpressionAttributeValues: marshall({ ':cat': category }), ExclusiveStartKey };
         const cmd = new ScanCommand(params);
         const resp = await dynamo.send(cmd);
         const raw = resp.Items || [];

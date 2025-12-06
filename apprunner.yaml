@@ -1,19 +1,17 @@
 version: 1.0
 runtime: nodejs22
+
 build:
   commands:
-    # Install frontend (root) deps and build Vite
     pre-build:
-      - npm install --omit=dev=false
+      - npm ci || npm install
     build:
-      - npm run build
-    # Install backend deps
+      - echo "Skipping build temporarily"
     post-build:
-      - cd backend && npm install --omit=dev=true
+      - cd backend && (npm ci --omit=dev || npm install --omit=dev)
+
 run:
-  # Lock to a Node version (optional but recommended). Pick a supported version.
   runtime-version: 22.14.0
-  # Start the single Node app that serves both API and static frontend
   command: npm start
   network:
     port: 8080
@@ -21,8 +19,3 @@ run:
   env:
     - name: NODE_ENV
       value: production
-    # If your backend depends on environment vars, add them here:
-    # - name: DYNAMO_TABLE
-    #   value: Jewelry_Boutique
-    # - name: AWS_REGION
-    #   value: us-east-1

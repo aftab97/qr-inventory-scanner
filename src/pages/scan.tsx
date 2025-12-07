@@ -2,8 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useLocation } from "react-router-dom";
 import { Camera, Check, X, ChevronRight, Minus, Plus } from "lucide-react";
 import QRScanner, { type QRScannerHandle } from "../components/qr/qr-scanner";
+import { isLocalHost } from "../api";
 
-const API_BASE = "http://localhost:3000";
+const API_BASE = isLocalHost ? "http://localhost:3000" : 'http://qr-scanner-api.us-east-1.elasticbeanstalk.com/'
 const LS_SELECTED_COLUMN = "scan_selected_column";
 
 type RawItem = Record<string, any>;

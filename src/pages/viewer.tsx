@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Trash2 } from "lucide-react";
 import * as XLSX from "xlsx";
+import { isLocalHost } from "../api";
 
-const API_BASE = "http://localhost:3000";
+const API_BASE = isLocalHost ? "http://localhost:3000" : 'http://qr-scanner-api.us-east-1.elasticbeanstalk.com/'
 
 // LocalStorage keys
 const LS_ROWS_KEY = "qr_viewer_row_selection_v1";

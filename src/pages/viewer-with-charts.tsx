@@ -14,6 +14,7 @@ import { Scatter } from "react-chartjs-2";
 import { Bar } from "react-chartjs-2";
 import { Doughnut } from "react-chartjs-2";
 import { Bubble } from "react-chartjs-2";
+import { isLocalHost } from "../api";
 
 ChartJS.register(
   CategoryScale,
@@ -26,7 +27,7 @@ ChartJS.register(
   Legend
 );
 
-const API_BASE = "http://localhost:3000";
+const API_BASE = isLocalHost ? "http://localhost:3000" : 'http://qr-scanner-api.us-east-1.elasticbeanstalk.com/'
 
 function Spinner({ className = "h-4 w-4 text-white" }) {
   return (

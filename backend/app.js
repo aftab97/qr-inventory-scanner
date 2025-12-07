@@ -1,29 +1,8 @@
-/**
- * Full backend server that:
- * - Serves the built Vite React frontend from /dist
- * - Exposes your existing API endpoints (categories, item patch, etc.)
- * - Uses a single port compatible with AWS App Runner managed Node runtime
- *
- * Notes:
- * - Build your frontend at repo root: `npm run build` produces ./dist
- * - This server expects ./dist to exist at runtime
- * - Frontend should call APIs with same-origin relative paths (e.g., "/categories", "/item/:id")
- */
-
-const fs = require('fs');
-const path = require('path');
 const express = require('express');
-const cors = require('cors');
 const multer = require('multer');
-// csv-parse v6 is ESM; use dynamic import to stay compatible with CommonJS here
-let parseCsvSync = null;
-async function getParseCsv() {
-  if (parseCsvSync) return parseCsvSync;
-  const mod = await import('csv-parse/sync');
-  parseCsvSync = mod.parse || mod.default || mod;
-  return parseCsvSync;
-}
+const { parse } = require('csv-parse/sync');
 const XLSX = require('xlsx');
+const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
 const {
@@ -35,45 +14,35 @@ const {
 } = require('@aws-sdk/client-dynamodb');
 const { marshall, unmarshall } = require('@aws-sdk/util-dynamodb');
 
-// Environment
-const NODE_ENV = process.env.NODE_ENV || 'production';
-// Prefer PORT (explicitly set in App Runner env), then APP_PORT, else 8080
-const PORT = Number(process.env.PORT || process.env.APP_PORT || 8080);
+const app = express();
+const port = 8080;
+const upload = multer({ storage: multer.memoryStorage() });
 
-// Dynamo/environment config (set via apprunner.yaml or App Runner console)
+// Configuration via environment variables:
 const DYNAMO_TABLE = process.env.DYNAMO_TABLE || 'Jewelry_Boutique';
 const DYNAMO_PK = process.env.DYNAMO_PK || 'ID';
 const AWS_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
 const DYNAMO_SCHEMA_PREFIX = process.env.DYNAMO_SCHEMA_PREFIX || '__meta__schema';
 
-const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
-
-// Basic request logging
-app.use((req, _res, next) => {
+// Basic logging to help debug routing
+app.use((req, res, next) => {
   console.log(new Date().toISOString(), req.method, req.originalUrl);
   next();
 });
 
-// CORS: if frontend and backend are same-origin on App Runner, CORS isn't needed.
-// Keep it permissive for local dev or cross-origin setups.
 app.use(cors());
 app.use('/parse', express.text({ type: ['text/csv', 'text/plain'], limit: '50mb' }));
 app.use(express.json());
 
-// Serve static frontend built by Vite
-// Ensure `npm run build` in repo root creates ./dist before deployment
-const distPath = path.resolve(__dirname, '..', 'dist');
-console.log('Resolved distPath:', distPath, 'exists:', fs.existsSync(distPath));
-app.use(express.static(distPath));
 
-// Health endpoint for App Runner
-app.get('/health', (_req, res) => res.json({ ok: true, env: NODE_ENV }));
+app.get('/', async (req, res) => {
+  return res.send('works')
+});
 
-// Dynamo helpers
 function createDynamoClient() {
   return new DynamoDBClient({ region: AWS_REGION });
 }
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function batchWriteWithRetries(dynamo, requestItems, maxRetries = 5) {
@@ -112,6 +81,7 @@ async function scanAll(dynamo, params = {}) {
 }
 
 async function collectPrimaryKeys(dynamo, category = null) {
+  if (!dynamo) throw new Error('Dynamo client required');
   if (category == null) {
     const rows = await scanAll(dynamo, { ProjectionExpression: DYNAMO_PK });
     return rows.map((r) => r[DYNAMO_PK]).filter(Boolean);
@@ -142,6 +112,7 @@ async function deleteAllItems(dynamo, category = null) {
 }
 
 async function putItems(dynamo, items) {
+  if (!dynamo) throw new Error('Dynamo client required');
   let writtenCount = 0;
   for (let i = 0; i < items.length; i += 25) {
     const chunk = items.slice(i, i + 25);
@@ -261,8 +232,6 @@ function buildItemsForDataset(rows, headerOriginalOrder, category) {
   return { items, missing, schemaItem, headerOriginalOrder: sanitizedHeaders, headerNormalizedOrder, warnings };
 }
 
-// API routes
-
 function parseCategoriesField(req) {
   if (req.body && typeof req.body.categories === 'string') {
     try {
@@ -273,7 +242,7 @@ function parseCategoriesField(req) {
   return {};
 }
 
-// POST /parse — preview/apply uploads
+// Main parse endpoint (preview/apply)
 app.post('/parse', upload.single('file'), async (req, res) => {
   try {
     let buffer = null; let text = null; let parseType = null;
@@ -316,7 +285,6 @@ app.post('/parse', upload.single('file'), async (req, res) => {
     }
 
     if (!datasets.length && text != null) {
-      const parse = await getParseCsv();
       const records = parse(text, { columns: true, skip_empty_lines: true, trim: false });
       if (!Array.isArray(records) || records.length === 0) return res.status(400).json({ error: 'No rows found in provided CSV' });
       if (!providedCategory && !(req.body && req.body.categories)) return res.status(400).json({ error: 'CSV upload requires category.' });
@@ -350,19 +318,7 @@ app.post('/parse', upload.single('file'), async (req, res) => {
     }
 
     if (!replaceMode && !updateMode) {
-      return res.json({
-        type: parseType,
-        datasets: allWork.map((w) => ({
-          sheetName: w.sheetName,
-          category: w.category,
-          headerOriginalOrder: w.headerOriginalOrder,
-          headerNormalizedOrder: w.headerNormalizedOrder,
-          rows: Math.max(0, w.items.length),
-          warnings: w.warnings || [],
-          defaultSelectedColumn: 'Total',
-        })),
-        note: 'Preview returned. To apply, POST again with ?update=true or ?replace=true and optionally categories mapping.',
-      });
+      return res.json({ type: parseType, datasets: allWork.map((w) => ({ sheetName: w.sheetName, category: w.category, headerOriginalOrder: w.headerOriginalOrder, headerNormalizedOrder: w.headerNormalizedOrder, rows: Math.max(0, w.items.length), warnings: w.warnings || [], defaultSelectedColumn: 'Total' })), note: 'Preview returned. To apply, POST again with ?update=true or ?replace=true and optionally categories mapping.' });
     }
 
     const dynamo = createDynamoClient();
@@ -373,27 +329,9 @@ app.post('/parse', upload.single('file'), async (req, res) => {
         if (replaceMode) {
           const existingKeys = await collectPrimaryKeys(dynamo, work.category);
           const deleteCount = existingKeys.length;
-          previews.push({
-            sheetName: work.sheetName,
-            category: work.category,
-            deleteCount,
-            deletePreview: existingKeys.slice(0, 200),
-            putCount: work.items.length,
-            putPreview: work.items.slice(0, 200),
-            schemaItemPreview: work.schemaItem,
-            warnings: work.warnings || [],
-            defaultSelectedColumn: 'Total',
-          });
+          previews.push({ sheetName: work.sheetName, category: work.category, deleteCount, deletePreview: existingKeys.slice(0, 200), putCount: work.items.length, putPreview: work.items.slice(0, 200), schemaItemPreview: work.schemaItem, warnings: work.warnings || [], defaultSelectedColumn: 'Total' });
         } else {
-          previews.push({
-            sheetName: work.sheetName,
-            category: work.category,
-            putCount: work.items.length,
-            putPreview: work.items.slice(0, 200),
-            schemaItemPreview: work.schemaItem,
-            warnings: work.warnings || [],
-            defaultSelectedColumn: 'Total',
-          });
+          previews.push({ sheetName: work.sheetName, category: work.category, putCount: work.items.length, putPreview: work.items.slice(0, 200), schemaItemPreview: work.schemaItem, warnings: work.warnings || [], defaultSelectedColumn: 'Total' });
         }
       }
       return res.json({ mode: replaceMode ? 'replace' : 'update', dry: true, previews });
@@ -425,24 +363,15 @@ app.post('/parse', upload.single('file'), async (req, res) => {
 });
 
 // List categories
-app.get('/categories', async (_req, res) => {
+app.get('/categories', async (req, res) => {
   try {
     const dynamo = createDynamoClient();
     const raw = await scanAll(dynamo, {});
-    const schemaItems = raw.filter((it) => {
-      const pkVal = it[DYNAMO_PK];
-      return typeof pkVal === 'string' && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`);
-    });
-    const categories = schemaItems.map((s) => ({
-      name: s.category,
-      headerOriginalOrder: s.headerOriginalOrder,
-      headerNormalizedOrder: s.headerNormalizedOrder,
-      updatedAt: s.updatedAt,
-    }));
+    const schemaItems = raw.filter((it) => { const pkVal = it[DYNAMO_PK]; return typeof pkVal === 'string' && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`); });
+    const categories = schemaItems.map((s) => ({ name: s.category, headerOriginalOrder: s.headerOriginalOrder, headerNormalizedOrder: s.headerNormalizedOrder, updatedAt: s.updatedAt }));
     return res.json({ categories });
   } catch (err) {
-    console.error('GET /categories error', err);
-    res.status(500).json({ error: 'Failed to list categories', details: String(err) });
+    console.error('GET /categories error', err); res.status(500).json({ error: 'Failed to list categories', details: String(err) });
   }
 });
 
@@ -469,7 +398,7 @@ function shouldExcludeColumn(normName) {
  * GET /columns
  * Aggregates column names across all categories (sheets).
  */
-app.get('/columns', async (_req, res) => {
+app.get('/columns', async (req, res) => {
   try {
     const dynamo = createDynamoClient();
     const all = await scanAll(dynamo, {});
@@ -509,7 +438,7 @@ app.get('/columns', async (_req, res) => {
   }
 });
 
-// GET /category/:name — items and schema for a category
+// Get items for a category (excludes schema)
 app.get('/category/:name', async (req, res) => {
   try {
     const dynamo = createDynamoClient();
@@ -519,13 +448,7 @@ app.get('/category/:name', async (req, res) => {
     const items = [];
     let ExclusiveStartKey = undefined;
     do {
-      const params = {
-        TableName: DYNAMO_TABLE,
-        FilterExpression: '#c = :cat',
-        ExpressionAttributeNames: { '#c': 'category' },
-        ExpressionAttributeValues: marshall({ ':cat': category }),
-        ExclusiveStartKey,
-      };
+      const params = { TableName: DYNAMO_TABLE, FilterExpression: '#c = :cat', ExpressionAttributeNames: { '#c': 'category' }, ExpressionAttributeValues: marshall({ ':cat': category }), ExclusiveStartKey };
       const cmd = new ScanCommand(params);
       const resp = await dynamo.send(cmd);
       const raw = resp.Items || [];
@@ -543,17 +466,16 @@ app.get('/category/:name', async (req, res) => {
 
     return res.json({ category, schema, items });
   } catch (err) {
-    console.error('GET /category/:name error', err);
-    res.status(500).json({ error: 'Failed to get category items', details: String(err) });
+    console.error('GET /category/:name error', err); res.status(500).json({ error: 'Failed to get category items', details: String(err) });
   }
 });
 
-// Helper: fetch item by ID (excluding schema items)
+// Helpers for schema-aware PATCH
 async function getItemById(dynamo, id) {
   const all = await scanAll(dynamo, {});
   for (const it of all) {
     const pkVal = it[DYNAMO_PK];
-    if (typeof pkVal === 'string' && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)) continue;
+    if (typeof pkVal === "string" && pkVal.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`)) continue;
     if (pkVal === id) return it;
   }
   return null;
@@ -564,7 +486,7 @@ async function getSchemaForCategory(dynamo, category) {
 }
 function norm(str) { return String(str || "").trim().toLowerCase(); }
 
-// PATCH /item/:id — schema-aware attribute update
+// PATCH item attribute — enforce column exists in category schema
 app.patch('/item/:id', async (req, res) => {
   try {
     const dynamo = createDynamoClient();
@@ -574,6 +496,7 @@ app.patch('/item/:id', async (req, res) => {
     const { attribute, value, category: bodyCategory } = req.body || {};
     if (!attribute) return res.status(400).json({ error: 'Missing attribute in body' });
 
+    // 1) Load item
     const item = await getItemById(dynamo, id);
     if (!item) return res.status(404).json({ error: 'Item not found' });
 
@@ -582,6 +505,7 @@ app.patch('/item/:id', async (req, res) => {
       return res.status(400).json({ error: 'Item category unknown; cannot validate attribute' });
     }
 
+    // 2) Load schema for category
     const schemaItem = await getSchemaForCategory(dynamo, effectiveCategory);
     if (!schemaItem) {
       return res.status(400).json({ error: `Schema not found for category "${effectiveCategory}"` });
@@ -594,6 +518,8 @@ app.patch('/item/:id', async (req, res) => {
       : [];
 
     const attrNorm = norm(attribute);
+
+    // 3) Validate attribute exists in schema
     if (!headerNorm.includes(attrNorm)) {
       return res.status(400).json({
         error: 'Attribute not allowed for this category',
@@ -602,6 +528,7 @@ app.patch('/item/:id', async (req, res) => {
       });
     }
 
+    // 4) Update with category condition
     const Key = marshall({ [DYNAMO_PK]: id });
     const ExpressionAttributeNames = { '#attr': attribute, '#cat': 'category' };
     const marshalledVals = marshall({ ':val': value, ':cat': effectiveCategory });
@@ -634,7 +561,7 @@ app.patch('/item/:id', async (req, res) => {
   }
 });
 
-// DELETE /item/:id — delete single item
+// DELETE single item
 app.delete('/item/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -660,8 +587,7 @@ app.delete('/category/:name', async (req, res) => {
     const result = await deleteAllItems(dynamo, category);
     return res.json({ message: 'Category deleted', category, deletedCount: result.deletedCount, deletedKeys: result.deletedKeys });
   } catch (err) {
-    console.error('DELETE /category/:name error', err);
-    res.status(500).json({ error: 'Failed to delete category', details: String(err) });
+    console.error('DELETE /category/:name error', err); res.status(500).json({ error: 'Failed to delete category', details: String(err) });
   }
 });
 
@@ -823,19 +749,15 @@ app.get('/export/category/:name', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${category}.xlsx"`);
     res.send(wbout);
   } catch (err) {
-    console.error('/export/category error', err);
-    res.status(500).json({ error: 'Failed to export category as XLSX', details: String(err) });
+    console.error('/export/category error', err); res.status(500).json({ error: 'Failed to export category as XLSX', details: String(err) });
   }
 });
 
-app.get('/export/all', async (_req, res) => {
+app.get('/export/all', async (req, res) => {
   try {
     const dynamo = createDynamoClient();
     const all = await scanAll(dynamo, {});
-    const schemaItems = all.filter((it) => {
-      const pk = it[DYNAMO_PK];
-      return typeof pk === 'string' && pk.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`);
-    });
+    const schemaItems = all.filter((it) => { const pk = it[DYNAMO_PK]; return typeof pk === 'string' && pk.startsWith(`${DYNAMO_SCHEMA_PREFIX}#`); });
     if (!schemaItems.length) return res.status(400).json({ error: 'No categories/schema found to export' });
     const workbook = XLSX.utils.book_new();
 
@@ -880,30 +802,14 @@ app.get('/export/all', async (_req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="all_categories.xlsx"`);
     res.send(wbout);
   } catch (err) {
-    console.error('Export all error', err);
-    res.status(500).json({ error: 'Failed to export all categories', details: String(err) });
+    console.error('Export all error', err); res.status(500).json({ error: 'Failed to export all categories', details: String(err) });
   }
 });
 
-// SPA fallback (serve index.html for non-API routes)
-app.get('*', (req, res, next) => {
-  const apiPrefixes = ['/parse', '/categories', '/category', '/item', '/health'];
-  if (apiPrefixes.some((p) => req.path.startsWith(p))) return next();
-  const indexFile = path.join(distPath, 'index.html');
-  if (fs.existsSync(indexFile)) {
-    res.sendFile(indexFile);
-  } else {
-    console.warn('index.html not found at', indexFile);
-    res.status(200).send('<!doctype html><html><head><meta charset="utf-8"><title>App</title></head><body><h1>Service is up</h1><p>Frontend build not found.</p></body></html>');
-  }
+app.listen(port, () => {
+  console.log(`CSV/XLSX app listening at http://localhost:${port}`);
+  console.log('ENV:', { DYNAMO_TABLE, DYNAMO_PK, AWS_REGION, DYNAMO_SCHEMA_PREFIX });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-  console.log('ENV:', { NODE_ENV, PORT, DYNAMO_TABLE, DYNAMO_PK, AWS_REGION, DYNAMO_SCHEMA_PREFIX });
-});
-
-// Process-level error handlers
 process.on('unhandledRejection', (reason) => { console.error('Unhandled Rejection:', reason); });
 process.on('uncaughtException', (err) => { console.error('Uncaught Exception:', err); process.exit(1); });

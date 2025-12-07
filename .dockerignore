@@ -1,15 +1,8 @@
 node_modules
-build
 dist
 .git
 .gitignore
 Dockerfile
-README.md
+apprunner.yaml
 npm-debug.log*
-yarn-error.log*
-**/.DS_Store
-**/*.local
-**/.env.local
-**/.env.development.local
-**/.env.production.local
-**/.env.test.local
+backend.zip

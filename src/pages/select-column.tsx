@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { isLocalHost } from "../api";
 
-const API_BASE = isLocalHost ? "http://localhost:3000" : 'http://qr-scanner-api.us-east-1.elasticbeanstalk.com/'
+const API_BASE = isLocalHost ? "http://localhost:3000" : 'http://qr-scanner-api.us-east-1.elasticbeanstalk.com'
 const LS_SELECTED_COLUMN = "scan_selected_column";
 const LS_COLUMNS_CACHE = "columns_cache_v1";
 const CACHE_TTL_MS = 1000 * 60 * 2; // 2 minutes

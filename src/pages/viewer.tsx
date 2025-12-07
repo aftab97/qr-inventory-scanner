@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Trash2, Plus } from "lucide-react";
-import * as XLSX from "xlsx";
+import { Trash2, Plus, Image as ImageIcon } from "lucide-react";
+import * as XLSX from "xlsx"; // kept for non-image export paths if needed
 import { isLocalHost } from "../api";
-import { v4 } from "uuid";
 
-const API_BASE = isLocalHost ? "http://localhost:8080" : "https://qr-inventory-scanner-backend.vercel.app";
+const API_BASE = isLocalHost
+  ? "http://localhost:8080"
+  : "https://qr-inventory-scanner-backend.vercel.app";
 
 // LocalStorage keys
 const LS_ROWS_KEY = "qr_viewer_row_selection_v1";
@@ -13,23 +14,48 @@ const LS_COLS_KEY = "qr_viewer_col_selection_v1";
 /**
  * Viewer.jsx
  *
- * Context menus:
- * - Right-click a header cell: "Add column (left/right)" (not on ID).
- * - Right-click a data cell (tbody): "Add row (top/bottom)" and "Delete row".
+ * Right-click:
+ * - Header cell: "Add column (left/right)" (not on ID).
+ * - Body cell: "Add row (top/bottom)", "Delete row", "Insert image".
+ *   Image insertion allowed on ANY column.
  */
 
 function Spinner({ className = "h-4 w-4 text-white" }) {
   return (
-    <svg className={`animate-spin ${className}`} viewBox="0 0 24 24" fill="none" stroke="currentColor">
+    <svg
+      className={`animate-spin ${className}`}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+    >
       <circle className="opacity-25" cx="12" cy="12" r="10" strokeWidth="3" />
-      <path className="opacity-75" d="M4 12a8 8 0 018-8" strokeWidth="3" strokeLinecap="round" />
+      <path
+        className="opacity-75"
+        d="M4 12a8 8 0 018-8"
+        strokeWidth="3"
+        strokeLinecap="round"
+      />
     </svg>
-  )
+  );
 }
 
-// UUID v4 generator (frontend) for default ID
+// UUID v4
 function uuidv4() {
-  return v4
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = crypto.getRandomValues(new Uint8Array(1))[0] & 0xf;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+// Try parse image JSON
+function parseImageValue(val) {
+  if (!val || typeof val !== "string") return null;
+  try {
+    const obj = JSON.parse(val);
+    if (obj && obj.type === "image" && obj.src) return obj;
+  } catch {}
+  return null;
 }
 
 export default function Viewer() {
@@ -52,7 +78,7 @@ export default function Viewer() {
   const [modalError, setModalError] = useState(null);
 
   // Editing state
-  const [editingCell, setEditingCell] = useState(null); // { id, normKey, original }
+  const [editingCell, setEditingCell] = useState(null);
   const [cellValue, setCellValue] = useState("");
   const [savingCellKey, setSavingCellKey] = useState(null);
 
@@ -62,7 +88,7 @@ export default function Viewer() {
   const [confirmReplaceOpen, setConfirmReplaceOpen] = useState(false);
 
   // Delete column modal
-  const [pendingDeleteColumn, setPendingDeleteColumn] = useState(null); // { columnOrig, columnNorm }
+  const [pendingDeleteColumn, setPendingDeleteColumn] = useState(null);
   // Delete rows modal
   const [pendingDeleteRowIds, setPendingDeleteRowIds] = useState([]);
   const [confirmDeleteRowsOpen, setConfirmDeleteRowsOpen] = useState(false);
@@ -84,7 +110,19 @@ export default function Viewer() {
   const [newRowIdChecking, setNewRowIdChecking] = useState(false);
   const [newRowIdExists, setNewRowIdExists] = useState(false);
 
-  // Context menus: supports 'column' and 'row'
+  // Insert image modal state
+  const [insertImageOpen, setInsertImageOpen] = useState(false);
+  const [insertImageTarget, setInsertImageTarget] = useState(null); // { id, normKey }
+  const [imageUploadMode, setImageUploadMode] = useState("upload"); // 'upload' | 'url'
+  const [imageFile, setImageFile] = useState(null);
+  const [imageUrl, setImageUrl] = useState("");
+  const [imageAlt, setImageAlt] = useState("");
+  const [imageWidth, setImageWidth] = useState(64);
+  const [imageHeight, setImageHeight] = useState(64);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState("");
+
+  // Context menus
   const [ctxMenu, setCtxMenu] = useState({
     open: false,
     x: 0,
@@ -95,6 +133,7 @@ export default function Viewer() {
     rowIndex: null,
     rowId: null,
     isHeaderCell: false,
+    cellNormKey: null,
   });
 
   // Close context menu on Escape or global click
@@ -114,14 +153,16 @@ export default function Viewer() {
   }, [ctxMenu.open]);
 
   // Persisted selections
-  const [columnSelectionByCategory, setColumnSelectionByCategory] = useState(() => {
-    try {
-      const raw = window.localStorage.getItem(LS_COLS_KEY);
-      return raw ? JSON.parse(raw) : {};
-    } catch {
-      return {};
+  const [columnSelectionByCategory, setColumnSelectionByCategory] = useState(
+    () => {
+      try {
+        const raw = window.localStorage.getItem(LS_COLS_KEY);
+        return raw ? JSON.parse(raw) : {};
+      } catch {
+        return {};
+      }
     }
-  });
+  );
   const [rowSelectionByCategory, setRowSelectionByCategory] = useState(() => {
     try {
       const raw = window.localStorage.getItem(LS_ROWS_KEY);
@@ -130,17 +171,28 @@ export default function Viewer() {
       return {};
     }
   });
-  const [exportSelectedRowsOnlyByCategory, setExportSelectedRowsOnlyByCategory] = useState({});
-  const [includeTotalsRowByCategory, setIncludeTotalsRowByCategory] = useState({});
+  const [
+    exportSelectedRowsOnlyByCategory,
+    setExportSelectedRowsOnlyByCategory,
+  ] = useState({});
+  const [includeTotalsRowByCategory, setIncludeTotalsRowByCategory] = useState(
+    {}
+  );
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(LS_COLS_KEY, JSON.stringify(columnSelectionByCategory));
+      window.localStorage.setItem(
+        LS_COLS_KEY,
+        JSON.stringify(columnSelectionByCategory)
+      );
     } catch {}
   }, [columnSelectionByCategory]);
   useEffect(() => {
     try {
-      window.localStorage.setItem(LS_ROWS_KEY, JSON.stringify(rowSelectionByCategory));
+      window.localStorage.setItem(
+        LS_ROWS_KEY,
+        JSON.stringify(rowSelectionByCategory)
+      );
     } catch {}
   }, [rowSelectionByCategory]);
 
@@ -162,12 +214,12 @@ export default function Viewer() {
       const json = await res.json();
       setCategories(json.categories || []);
       if (json.categories?.length) {
-        if (!active || !json.categories.find((c) => c.name === active)) setActive(json.categories[0].name);
+        if (!active || !json.categories.find((c) => c.name === active))
+          setActive(json.categories[0].name);
       } else {
         setActive(null);
       }
     } catch (err) {
-      console.error("loadCategories", err);
       setError(err?.message || "Failed to load categories");
     } finally {
       setLoadingCats(false);
@@ -180,21 +232,29 @@ export default function Viewer() {
     setSchema(null);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/category/${encodeURIComponent(category)}`);
+      const res = await fetch(
+        `${API_BASE}/category/${encodeURIComponent(category)}`
+      );
       if (!res.ok) throw new Error(await res.text());
       const json = await res.json();
-      const loadedItems = json.items || [];
       setSchema(json.schema || null);
-      setItems(loadedItems);
-      initializeSelectionForCategory(category, json.schema || null, loadedItems);
+      setItems(json.items || []);
+      initializeSelectionForCategory(
+        category,
+        json.schema || null,
+        json.items || []
+      );
       setExportSelectedRowsOnlyByCategory((prev) =>
-        prev && typeof prev[category] !== "undefined" ? prev : { ...(prev || {}), [category]: false }
+        prev && typeof prev[category] !== "undefined"
+          ? prev
+          : { ...(prev || {}), [category]: false }
       );
       setIncludeTotalsRowByCategory((prev) =>
-        prev && typeof prev[category] !== "undefined" ? prev : { ...(prev || {}), [category]: true }
+        prev && typeof prev[category] !== "undefined"
+          ? prev
+          : { ...(prev || {}), [category]: true }
       );
     } catch (err) {
-      console.error("loadCategoryItems", err);
       setError(err?.message || "Failed to load items");
     } finally {
       setLoadingItems(false);
@@ -208,19 +268,29 @@ export default function Viewer() {
     }
     setNewRowIdChecking(true);
     try {
-      const res = await fetch(`${API_BASE}/item/exists/${encodeURIComponent(id)}`);
-      const ok = res.ok;
-      const json = ok ? await res.json() : {};
+      const res = await fetch(
+        `${API_BASE}/item/exists/${encodeURIComponent(id)}`
+      );
+      const json = res.ok ? await res.json() : {};
       const exists = !!json.exists;
       setNewRowIdExists(exists);
       return exists;
-    } catch (err) {
-      console.error("checkIdExists", err);
+    } catch {
       setNewRowIdExists(false);
       return false;
     } finally {
       setNewRowIdChecking(false);
     }
+  }
+
+  async function presignUpload(filename, contentType, meta) {
+    const res = await fetch(`${API_BASE}/uploads/presign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename, contentType, ...meta }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return await res.json(); // { uploadUrl, finalUrl, s3Key, expires }
   }
 
   // ----------------- Header helpers -----------------
@@ -230,11 +300,14 @@ export default function Viewer() {
     return Object.keys(items[0]).filter((k) => k !== "category" && k !== "ID");
   }
   function headerNormalizedOrder() {
-    if (schema?.headerNormalizedOrder?.length) return schema.headerNormalizedOrder;
+    if (schema?.headerNormalizedOrder?.length)
+      return schema.headerNormalizedOrder;
     return headerOriginalOrder().map((h) => String(h).toLowerCase());
   }
   function norm(s) {
-    return String(s || "").trim().toLowerCase();
+    return String(s || "")
+      .trim()
+      .toLowerCase();
   }
 
   // ----------------- Initialize selections -----------------
@@ -242,12 +315,11 @@ export default function Viewer() {
     setColumnSelectionByCategory((prev) => {
       if (prev?.[category]) return prev;
       const next = { ...(prev || {}) };
-      const orig =
-        schemaObj?.headerOriginalOrder?.length
-          ? schemaObj.headerOriginalOrder.slice()
-          : itemsArr?.length
-          ? Object.keys(itemsArr[0]).filter((k) => k !== "category" && k !== "ID")
-          : [];
+      const orig = schemaObj?.headerOriginalOrder?.length
+        ? schemaObj.headerOriginalOrder.slice()
+        : itemsArr?.length
+        ? Object.keys(itemsArr[0]).filter((k) => k !== "category" && k !== "ID")
+        : [];
       const normalized = orig.map((h) => String(h).toLowerCase());
       const map = { id: true, total: true };
       normalized.forEach((n) => (map[n] = true));
@@ -304,28 +376,37 @@ export default function Viewer() {
   }
   function areAllRowsSelected() {
     if (!active) return false;
-    const map = (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
+    const map =
+      (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
     if (!items?.length) return false;
     return items.every((it) => !!map[it.ID]);
   }
   function anyRowSelected() {
     if (!active) return false;
-    const map = (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
+    const map =
+      (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
     return (items || []).some((it) => !!map[it.ID]);
   }
 
   // ----------------- Delete rows bulk -----------------
   function onRequestDeleteSelectedRows() {
     if (!active) return;
-    const map = (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
+    const map =
+      (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
     const ids = (items || []).filter((it) => !!map[it.ID]).map((it) => it.ID);
     if (!ids.length) {
-      setModalError({ title: "No rows selected", message: "Select rows to delete first." });
+      setModalError({
+        title: "No rows selected",
+        message: "Select rows to delete first.",
+      });
       return;
     }
     const firstId = items[0] ? items[0].ID : null;
     if (ids.includes(firstId)) {
-      setModalError({ title: "Cannot delete first row", message: "The first data row is protected and cannot be deleted." });
+      setModalError({
+        title: "Cannot delete first row",
+        message: "The first data row is protected and cannot be deleted.",
+      });
       return;
     }
     setPendingDeleteRowIds(ids);
@@ -340,25 +421,36 @@ export default function Viewer() {
     setDeletingRows(true);
     try {
       const responses = await Promise.all(
-        pendingDeleteRowIds.map((id) => fetch(`${API_BASE}/item/${encodeURIComponent(id)}`, { method: "DELETE" }))
+        pendingDeleteRowIds.map((id) =>
+          fetch(`${API_BASE}/item/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+          })
+        )
       );
       const failed = [];
       for (let i = 0; i < responses.length; i++) {
         if (!responses[i].ok) {
           const txt = await responses[i].text().catch(() => "");
-          failed.push({ id: pendingDeleteRowIds[i], text: txt, status: responses[i].status });
+          failed.push({
+            id: pendingDeleteRowIds[i],
+            text: txt,
+            status: responses[i].status,
+          });
         }
       }
-      if (failed.length) {
-        console.error("some deletes failed", failed);
-        setModalError({ title: "Delete incomplete", message: `Failed to delete ${failed.length} rows. See console.` });
-      }
+      if (failed.length)
+        setModalError({
+          title: "Delete incomplete",
+          message: `Failed to delete ${failed.length} rows. See console.`,
+        });
       await loadCategoryItems(active);
       setPendingDeleteRowIds([]);
       setConfirmDeleteRowsOpen(false);
     } catch (err) {
-      console.error("confirmDeleteSelectedRows", err);
-      setModalError({ title: "Delete failed", message: err?.message || "Unable to delete rows." });
+      setModalError({
+        title: "Delete failed",
+        message: err?.message || "Unable to delete rows.",
+      });
     } finally {
       setDeletingRows(false);
     }
@@ -366,7 +458,9 @@ export default function Viewer() {
 
   // ----------------- Column delete -----------------
   function isProtectedColumn(orig) {
-    const n = String(orig || "").trim().toLowerCase();
+    const n = String(orig || "")
+      .trim()
+      .toLowerCase();
     return n === "nom" || n === "nombre" || n === "pierres" || n === "piedras";
   }
   async function confirmDeleteColumn() {
@@ -376,19 +470,30 @@ export default function Viewer() {
     }
     const col = pendingDeleteColumn.columnOrig;
     if (isProtectedColumn(col)) {
-      setModalError({ title: "Protected column", message: `The column "${col}" cannot be deleted.` });
+      setModalError({
+        title: "Protected column",
+        message: `The column "${col}" cannot be deleted.`,
+      });
       setPendingDeleteColumn(null);
       return;
     }
     setDeletingColumn(true);
     try {
-      let res = await fetch(`${API_BASE}/category/${encodeURIComponent(active)}/column/${encodeURIComponent(col)}`, { method: "DELETE" });
+      let res = await fetch(
+        `${API_BASE}/category/${encodeURIComponent(
+          active
+        )}/column/${encodeURIComponent(col)}`,
+        { method: "DELETE" }
+      );
       if (!res.ok) {
-        res = await fetch(`${API_BASE}/category/${encodeURIComponent(active)}/column`, {
-          method: "DELETE",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ column: col }),
-        });
+        res = await fetch(
+          `${API_BASE}/category/${encodeURIComponent(active)}/column`,
+          {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ column: col }),
+          }
+        );
       }
       if (!res.ok) {
         const txt = await res.text().catch(() => "");
@@ -397,8 +502,10 @@ export default function Viewer() {
       await loadCategoryItems(active);
       setPendingDeleteColumn(null);
     } catch (err) {
-      console.error("confirmDeleteColumn", err);
-      setModalError({ title: "Delete column failed", message: err?.message || "Unable to delete column." });
+      setModalError({
+        title: "Delete column failed",
+        message: err?.message || "Unable to delete column.",
+      });
     } finally {
       setDeletingColumn(false);
     }
@@ -414,24 +521,43 @@ export default function Viewer() {
     if (!active) return;
     const name = newColumnName.trim();
     if (!name) {
-      setModalError({ title: "Column name required", message: "Please enter a column name." });
+      setModalError({
+        title: "Column name required",
+        message: "Please enter a column name.",
+      });
       return;
     }
     setInsertingColumn(true);
     try {
-      const res = await fetch(`${API_BASE}/category/${encodeURIComponent(active)}/column`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ columnName: name, insertIndex: insertColumnIndex, defaultValue: null }),
-      });
+      const res = await fetch(
+        `${API_BASE}/category/${encodeURIComponent(active)}/column`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            columnName: name,
+            insertIndex: insertColumnIndex,
+            defaultValue: null,
+          }),
+        }
+      );
       if (!res.ok) throw new Error(await res.text());
       const nName = norm(name);
       setSchema((prev) => {
-        const orig = prev?.headerOriginalOrder ? prev.headerOriginalOrder.slice() : headerOriginalOrder().slice();
-        const normArr = prev?.headerNormalizedOrder ? prev.headerNormalizedOrder.slice() : headerNormalizedOrder().slice();
+        const orig = prev?.headerOriginalOrder
+          ? prev.headerOriginalOrder.slice()
+          : headerOriginalOrder().slice();
+        const normArr = prev?.headerNormalizedOrder
+          ? prev.headerNormalizedOrder.slice()
+          : headerNormalizedOrder().slice();
         orig.splice(insertColumnIndex, 0, name);
         normArr.splice(insertColumnIndex, 0, nName);
-        return { ...(prev || {}), headerOriginalOrder: orig, headerNormalizedOrder: normArr, updatedAt: new Date().toISOString() };
+        return {
+          ...(prev || {}),
+          headerOriginalOrder: orig,
+          headerNormalizedOrder: normArr,
+          updatedAt: new Date().toISOString(),
+        };
       });
       setItems((prev) => prev.map((it) => ({ ...it, [nName]: null })));
       setColumnSelectionByCategory((prev) => {
@@ -440,8 +566,10 @@ export default function Viewer() {
       });
       setInsertColumnOpen(false);
     } catch (err) {
-      console.error("confirmInsertColumn", err);
-      setModalError({ title: "Add column failed", message: err?.message || "Unable to add column." });
+      setModalError({
+        title: "Add column failed",
+        message: err?.message || "Unable to add column.",
+      });
     } finally {
       setInsertingColumn(false);
     }
@@ -450,8 +578,11 @@ export default function Viewer() {
   // ----------------- Context menus -----------------
   function onHeaderCellContextMenu(e, idx, label) {
     e.preventDefault();
-    const isId = String(label || "").trim().toLowerCase() === "id";
-    if (isId) return; // No menu for ID column
+    const isId =
+      String(label || "")
+        .trim()
+        .toLowerCase() === "id";
+    if (isId) return;
     setCtxMenu({
       open: true,
       x: e.clientX + 2,
@@ -462,14 +593,14 @@ export default function Viewer() {
       rowIndex: null,
       rowId: null,
       isHeaderCell: true,
+      cellNormKey: null,
     });
   }
   function ColumnContextMenu() {
     if (!ctxMenu.open || ctxMenu.type !== "column") return null;
     const idx = ctxMenu.columnIndex ?? 0;
     const colName = String(ctxMenu.columnName || "");
-    const isId = colName.trim().toLowerCase() === "id";
-    if (isId) return null;
+    if (colName.trim().toLowerCase() === "id") return null;
 
     return (
       <div
@@ -478,17 +609,29 @@ export default function Viewer() {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-3 py-2 text-xs text-gray-500">Column: {colName}</div>
-        <button className="w-full text-left px-3 py-2 hover:bg-gray-100" onClick={() => { setCtxMenu((p) => ({ ...p, open: false })); openInsertColumnAt(idx); }}>
+        <button
+          className="w-full text-left px-3 py-2 hover:bg-gray-100"
+          onClick={() => {
+            setCtxMenu((p) => ({ ...p, open: false }));
+            openInsertColumnAt(idx);
+          }}
+        >
           Add column (left)
         </button>
-        <button className="w-full text-left px-3 py-2 hover:bg-gray-100" onClick={() => { setCtxMenu((p) => ({ ...p, open: false })); openInsertColumnAt(idx + 1); }}>
+        <button
+          className="w-full text-left px-3 py-2 hover:bg-gray-100"
+          onClick={() => {
+            setCtxMenu((p) => ({ ...p, open: false }));
+            openInsertColumnAt(idx + 1);
+          }}
+        >
           Add column (right)
         </button>
       </div>
     );
   }
 
-  function onBodyRowContextMenu(e, rowIdx, rowId) {
+  function onBodyCellContextMenu(e, rowIdx, rowId, cellNormKey) {
     e.preventDefault();
     setCtxMenu({
       open: true,
@@ -500,6 +643,7 @@ export default function Viewer() {
       rowIndex: rowIdx,
       rowId,
       isHeaderCell: false,
+      cellNormKey,
     });
   }
 
@@ -522,12 +666,18 @@ export default function Viewer() {
     if (!active) return;
     const id = String(newRowId || "").trim();
     if (!id) {
-      setModalError({ title: "ID required", message: "Please enter an ID for the new row." });
+      setModalError({
+        title: "ID required",
+        message: "Please enter an ID for the new row.",
+      });
       return;
     }
     const exists = await checkIdExists(id);
     if (exists) {
-      setModalError({ title: "ID already exists", message: `Another item with ID "${id}" already exists. Choose a different ID.` });
+      setModalError({
+        title: "ID already exists",
+        message: `Another item with ID "${id}" already exists. Choose a different ID.`,
+      });
       return;
     }
     setInsertingRow(true);
@@ -540,11 +690,14 @@ export default function Viewer() {
         values[nk] = v === "" ? null : v;
       }
 
-      const res = await fetch(`${API_BASE}/category/${encodeURIComponent(active)}/row`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ insertIndex: insertRowIndex, id, values }),
-      });
+      const res = await fetch(
+        `${API_BASE}/category/${encodeURIComponent(active)}/row`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ insertIndex: insertRowIndex, id, values }),
+        }
+      );
       if (!res.ok) {
         const txt = await res.text().catch(() => "");
         throw new Error(txt || `Server responded ${res.status}`);
@@ -568,30 +721,34 @@ export default function Viewer() {
       });
       setInsertRowOpen(false);
     } catch (err) {
-      console.error("confirmInsertRow", err);
-      setModalError({ title: "Add row failed", message: err?.message || "Unable to add row." });
+      setModalError({
+        title: "Add row failed",
+        message: err?.message || "Unable to add row.",
+      });
     } finally {
       setInsertingRow(false);
     }
   }
 
-  // NEW: Delete a single row from row context menu
   async function deleteRowById(id) {
     if (!id) return;
-    // prevent deleting first row as per existing policy
     const firstId = items[0] ? items[0].ID : null;
     if (id === firstId) {
-      setModalError({ title: "Cannot delete first row", message: "The first data row is protected and cannot be deleted." });
+      setModalError({
+        title: "Cannot delete first row",
+        message: "The first data row is protected and cannot be deleted.",
+      });
       return;
     }
     setDeletingRows(true);
     try {
-      const res = await fetch(`${API_BASE}/item/${encodeURIComponent(id)}`, { method: "DELETE" });
+      const res = await fetch(`${API_BASE}/item/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
       if (!res.ok) {
         const txt = await res.text().catch(() => "");
         throw new Error(txt || `Server responded ${res.status}`);
       }
-      // Remove locally for snappier UX, then optionally reload
       setItems((prev) => prev.filter((it) => it.ID !== id));
       setRowSelectionByCategory((prev) => {
         const map = (prev && prev[active]) || {};
@@ -600,8 +757,10 @@ export default function Viewer() {
         return { ...prev, [active]: nextMap };
       });
     } catch (err) {
-      console.error("deleteRowById", err);
-      setModalError({ title: "Delete failed", message: err?.message || "Unable to delete row." });
+      setModalError({
+        title: "Delete failed",
+        message: err?.message || "Unable to delete row.",
+      });
     } finally {
       setDeletingRows(false);
       setCtxMenu((p) => ({ ...p, open: false }));
@@ -609,13 +768,15 @@ export default function Viewer() {
   }
 
   function RowContextMenu() {
-    if (!ctxMenu.open || ctxMenu.type !== "row" || ctxMenu.isHeaderCell) return null;
+    if (!ctxMenu.open || ctxMenu.type !== "row" || ctxMenu.isHeaderCell)
+      return null;
     const idx = ctxMenu.rowIndex ?? 0;
     const rowId = ctxMenu.rowId;
+    const cellNormKey = ctxMenu.cellNormKey || null;
     return (
       <div
         className="fixed z-50 bg-white border border-gray-300 rounded shadow-lg"
-        style={{ top: ctxMenu.y, left: ctxMenu.x, minWidth: 220 }}
+        style={{ top: ctxMenu.y, left: ctxMenu.x, minWidth: 240 }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-3 py-2 text-xs text-gray-500">Row #{idx + 1}</div>
@@ -647,13 +808,285 @@ export default function Viewer() {
         >
           {deletingRows ? "Deleting…" : "Delete row"}
         </button>
+        <div className="border-t my-1" />
+        <button
+          className="w-full text-left px-3 py-2 hover:bg-gray-100 flex items-center gap-2"
+          onClick={() => {
+            setCtxMenu((p) => ({ ...p, open: false }));
+            setInsertImageTarget({ id: rowId, normKey: cellNormKey });
+            setImageUploadMode("upload");
+            setImageFile(null);
+            setImageUrl("");
+            setImageAlt("");
+            setImageWidth(64);
+            setImageHeight(64);
+            setImagePreviewUrl("");
+            setInsertImageOpen(true);
+          }}
+        >
+          <ImageIcon className="h-4 w-4" /> Insert image
+        </button>
       </div>
     );
   }
 
+  // ----------------- Image Insert Modal -----------------
+  const InsertImageModal = insertImageOpen ? (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={() => !uploadingImage && setInsertImageOpen(false)}
+    >
+      <div
+        className="bg-white rounded-lg shadow-lg p-6 max-w-lg w-full"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="text-lg font-semibold mb-2">Insert image</h3>
+        <p className="text-sm text-gray-700 mb-4">
+          Set image for item <strong>{insertImageTarget?.id}</strong>, column{" "}
+          <strong>{insertImageTarget?.normKey}</strong>.
+        </p>
+
+        <div className="mb-3">
+          <div className="flex gap-2">
+            <button
+              className={`px-3 py-1 rounded ${
+                imageUploadMode === "upload"
+                  ? "bg-indigo-600 text-white"
+                  : "bg-gray-200"
+              }`}
+              onClick={() => setImageUploadMode("upload")}
+              disabled={uploadingImage}
+            >
+              Upload file
+            </button>
+            <button
+              className={`px-3 py-1 rounded ${
+                imageUploadMode === "url"
+                  ? "bg-indigo-600 text-white"
+                  : "bg-gray-200"
+              }`}
+              onClick={() => setImageUploadMode("url")}
+              disabled={uploadingImage}
+            >
+              Paste URL
+            </button>
+          </div>
+        </div>
+
+        {imageUploadMode === "upload" ? (
+          <div className="mb-3">
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => {
+                const f = e.target.files?.[0] ?? null;
+                setImageFile(f);
+                if (f) {
+                  const localUrl = URL.createObjectURL(f);
+                  setImagePreviewUrl(localUrl);
+                } else setImagePreviewUrl("");
+              }}
+            />
+          </div>
+        ) : (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Image URL</label>
+            <input
+              className="w-full border rounded px-2 py-2"
+              placeholder="https://example.com/image.jpg"
+              value={imageUrl}
+              onChange={(e) => {
+                setImageUrl(e.target.value);
+                setImagePreviewUrl(e.target.value);
+              }}
+            />
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-3 mb-3">
+          <div>
+            <label className="block text-sm font-medium mb-1">Width (px)</label>
+            <input
+              type="number"
+              min={16}
+              max={1024}
+              className="w-full border rounded px-2 py-2"
+              value={imageWidth}
+              onChange={(e) => setImageWidth(Number(e.target.value || 64))}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">
+              Height (px)
+            </label>
+            <input
+              type="number"
+              min={16}
+              max={1024}
+              className="w-full border rounded px-2 py-2"
+              value={imageHeight}
+              onChange={(e) => setImageHeight(Number(e.target.value || 64))}
+            />
+          </div>
+        </div>
+
+        <div className="mb-3">
+          <label className="block text-sm font-medium mb-1">
+            Alt text (optional)
+          </label>
+          <input
+            className="w-full border rounded px-2 py-2"
+            placeholder="Description"
+            value={imageAlt}
+            onChange={(e) => setImageAlt(e.target.value)}
+          />
+        </div>
+
+        {imagePreviewUrl ? (
+          <div className="mb-4">
+            <div className="text-xs text-gray-600 mb-1">Preview</div>
+            <div
+              className="border rounded p-2 flex items-center justify-center"
+              style={{ maxHeight: 200 }}
+            >
+              <img
+                src={imagePreviewUrl}
+                alt={imageAlt || "preview"}
+                style={{
+                  maxWidth: "100%",
+                  maxHeight: "180px",
+                  objectFit: "contain",
+                }}
+              />
+            </div>
+          </div>
+        ) : null}
+
+        <div className="flex gap-2 justify-end">
+          <button
+            onClick={() => setInsertImageOpen(false)}
+            className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={async () => {
+              if (
+                !insertImageTarget?.id ||
+                !insertImageTarget?.normKey ||
+                !active
+              )
+                return;
+              setUploadingImage(true);
+              try {
+                let finalUrl = "";
+                let s3Key = "";
+                if (imageUploadMode === "upload") {
+                  if (!imageFile)
+                    throw new Error("Please choose an image file.");
+                  const contentType =
+                    imageFile.type || "application/octet-stream";
+                  const meta = {
+                    category: active,
+                    itemId: insertImageTarget.id,
+                    column: insertImageTarget.normKey,
+                  };
+                  const presigned = await presignUpload(
+                    imageFile.name,
+                    contentType,
+                    meta
+                  );
+                  const putRes = await fetch(presigned.uploadUrl, {
+                    method: "PUT",
+                    headers: { "Content-Type": contentType },
+                    body: imageFile,
+                  });
+                  if (!putRes.ok) throw new Error(await putRes.text());
+                  finalUrl = presigned.finalUrl || "";
+                  s3Key = presigned.s3Key || "";
+                } else {
+                  if (!imageUrl || !/^https?:\/\//i.test(imageUrl))
+                    throw new Error("Please enter a valid image URL.");
+                  finalUrl = imageUrl.trim();
+                }
+
+                const payload = {
+                  type: "image",
+                  src: finalUrl,
+                  alt: imageAlt || "",
+                  width: Number(imageWidth || 64),
+                  height: Number(imageHeight || 64),
+                  ...(s3Key ? { s3Key } : {}),
+                };
+                const valueStr = JSON.stringify(payload);
+
+                // Save to cell
+                const res = await fetch(
+                  `${API_BASE}/item/${encodeURIComponent(
+                    insertImageTarget.id
+                  )}`,
+                  {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      attribute: insertImageTarget.normKey,
+                      value: valueStr,
+                      category: active,
+                    }),
+                  }
+                );
+                if (!res.ok) throw new Error(await res.text());
+                const json = await res.json();
+                const updated = json.updated || null;
+
+                setItems((prev) =>
+                  prev.map((it) =>
+                    it.ID === insertImageTarget.id
+                      ? {
+                          ...it,
+                          [insertImageTarget.normKey]: valueStr,
+                          ...(updated || {}),
+                        }
+                      : it
+                  )
+                );
+                setInsertImageOpen(false);
+              } catch (err) {
+                setModalError({
+                  title: "Insert image failed",
+                  message: err?.message || "Unable to insert image.",
+                });
+              } finally {
+                setUploadingImage(false);
+              }
+            }}
+            disabled={
+              uploadingImage ||
+              (imageUploadMode === "upload" && !imageFile) ||
+              (imageUploadMode === "url" && !imageUrl)
+            }
+            className="px-3 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700"
+          >
+            {uploadingImage ? <Spinner className="h-4 w-4 text-white" /> : null}
+            <span>{uploadingImage ? "Uploading…" : "Insert image"}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   // ----------------- Totals + export -----------------
   function computeTotalForItem(item, headerNorms) {
-    const excluded = new Set(["id", "nombre", "nom", "fotos", "pierres", "piedras", "pictures", "photos"]);
+    const excluded = new Set([
+      "id",
+      "nombre",
+      "nom",
+      "fotos",
+      "pierres",
+      "piedras",
+      "pictures",
+      "photos",
+    ]);
     let sum = 0;
     for (const k of headerNorms) {
       const nk = String(k || "").toLowerCase();
@@ -667,7 +1100,14 @@ export default function Viewer() {
   }
   function computeColumnTotalsForItems(itemsArr, headerNorms) {
     const totals = {};
-    const excluded = new Set(["id", "nom", "nombre", "pierres", "piedras", "total"]);
+    const excluded = new Set([
+      "id",
+      "nom",
+      "nombre",
+      "pierres",
+      "piedras",
+      "total",
+    ]);
     for (const nk of headerNorms) {
       const key = String(nk || "").toLowerCase();
       if (excluded.has(key)) {
@@ -698,9 +1138,18 @@ export default function Viewer() {
     map["total"] = true;
     return map;
   }
-   function buildRowsForExport(itemsArr, headerOrig, headerNorm, selection, rowSelectionMap, exportSelectedOnly, includeTotalsRow) {
+  function buildRowsForExport(
+    itemsArr,
+    headerOrig,
+    headerNorm,
+    selection,
+    rowSelectionMap,
+    exportSelectedOnly,
+    includeTotalsRow
+  ) {
     let filteredItems = itemsArr;
-    if (exportSelectedOnly && rowSelectionMap) filteredItems = itemsArr.filter((it) => !!rowSelectionMap[it.ID]);
+    if (exportSelectedOnly && rowSelectionMap)
+      filteredItems = itemsArr.filter((it) => !!rowSelectionMap[it.ID]);
 
     const rows = [];
     const headers = [];
@@ -718,7 +1167,10 @@ export default function Viewer() {
       if (selection["id"]) r.push(it.ID);
       for (let i = 0; i < headerOrig.length; i++) {
         const normKey = headerNorm[i];
-        if (selection[normKey]) r.push(it[normKey] === undefined || it[normKey] === null ? "" : it[normKey]);
+        if (selection[normKey])
+          r.push(
+            it[normKey] === undefined || it[normKey] === null ? "" : it[normKey]
+          );
       }
       if (selection["total"]) r.push(computeTotalForItem(it, headerNorm));
       rows.push(r);
@@ -736,7 +1188,10 @@ export default function Viewer() {
         }
       }
       if (selection["total"]) {
-        const totOfTotals = filteredItems.reduce((acc, it) => acc + computeTotalForItem(it, headerNorm), 0);
+        const totOfTotals = filteredItems.reduce(
+          (acc, it) => acc + computeTotalForItem(it, headerNorm),
+          0
+        );
         totalsRow.push(totOfTotals);
       }
       rows.push(totalsRow);
@@ -750,28 +1205,42 @@ export default function Viewer() {
       let useItems = items;
       let useSchema = schema;
       if (category !== active) {
-        const res = await fetch(`${API_BASE}/category/${encodeURIComponent(category)}`);
+        const res = await fetch(
+          `${API_BASE}/category/${encodeURIComponent(category)}`
+        );
         if (!res.ok) throw new Error(await res.text());
         const json = await res.json();
         useItems = json.items || [];
         useSchema = json.schema || null;
       }
-      const headerOrig =
-        useSchema?.headerOriginalOrder?.length
-          ? useSchema.headerOriginalOrder
-          : useItems.length
-          ? Object.keys(useItems[0]).filter((k) => k !== "category" && k !== "ID")
-          : [];
+      const headerOrig = useSchema?.headerOriginalOrder?.length
+        ? useSchema.headerOriginalOrder
+        : useItems.length
+        ? Object.keys(useItems[0]).filter((k) => k !== "category" && k !== "ID")
+        : [];
       const headerNorm = headerOrig.map((h) => String(h).toLowerCase());
       const selection = getSelectionForCategory(category, headerNorm);
-      const rowSelectionMap = (rowSelectionByCategory && rowSelectionByCategory[category]) || null;
+      const rowSelectionMap =
+        (rowSelectionByCategory && rowSelectionByCategory[category]) || null;
       const exportSelectedOnly = !!exportSelectedRowsOnlyByCategory[category];
       const includeTotalsRow = !!includeTotalsRowByCategory[category];
 
-      const rows = buildRowsForExport(useItems, headerOrig, headerNorm, selection, rowSelectionMap, exportSelectedOnly, includeTotalsRow);
+      const rows = buildRowsForExport(
+        useItems,
+        headerOrig,
+        headerNorm,
+        selection,
+        rowSelectionMap,
+        exportSelectedOnly,
+        includeTotalsRow
+      );
       const ws = XLSX.utils.aoa_to_sheet(rows);
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, (category || "category").substring(0, 31));
+      XLSX.utils.book_append_sheet(
+        wb,
+        ws,
+        (category || "category").substring(0, 31)
+      );
       const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
       const blob = new Blob([wbout], { type: "application/octet-stream" });
       const url = URL.createObjectURL(blob);
@@ -784,7 +1253,10 @@ export default function Viewer() {
       URL.revokeObjectURL(url);
     } catch (err) {
       console.error("exportCategoryWithSelection", err);
-      setModalError({ title: "Export failed", message: err?.message || "Unable to export category." });
+      setModalError({
+        title: "Export failed",
+        message: err?.message || "Unable to export category.",
+      });
     } finally {
       setExportingCategory(false);
     }
@@ -795,7 +1267,9 @@ export default function Viewer() {
       const wb = XLSX.utils.book_new();
       const catNames = categories.map((c) => c.name);
       for (const catName of catNames) {
-        const res = await fetch(`${API_BASE}/category/${encodeURIComponent(catName)}`);
+        const res = await fetch(
+          `${API_BASE}/category/${encodeURIComponent(catName)}`
+        );
         if (!res.ok) {
           console.warn(`Skipping category ${catName}: failed to fetch items`);
           continue;
@@ -803,22 +1277,36 @@ export default function Viewer() {
         const json = await res.json();
         const useItems = json.items || [];
         const useSchema = json.schema || null;
-        const headerOrig =
-          useSchema?.headerOriginalOrder?.length
-            ? useSchema.headerOriginalOrder
-            : useItems.length
-            ? Object.keys(useItems[0]).filter((k) => k !== "category" && k !== "ID")
-            : [];
+        const headerOrig = useSchema?.headerOriginalOrder?.length
+          ? useSchema.headerOriginalOrder
+          : useItems.length
+          ? Object.keys(useItems[0]).filter(
+              (k) => k !== "category" && k !== "ID"
+            )
+          : [];
         const headerNorm = headerOrig.map((h) => String(h).toLowerCase());
         const selection = getSelectionForCategory(catName, headerNorm);
 
-        const rowSelectionMap = (rowSelectionByCategory && rowSelectionByCategory[catName]) || null;
+        const rowSelectionMap =
+          (rowSelectionByCategory && rowSelectionByCategory[catName]) || null;
         const exportSelectedOnly = !!exportSelectedRowsOnlyByCategory[catName];
         const includeTotalsRow = !!includeTotalsRowByCategory[catName];
 
-        const rows = buildRowsForExport(useItems, headerOrig, headerNorm, selection, rowSelectionMap, exportSelectedOnly, includeTotalsRow);
+        const rows = buildRowsForExport(
+          useItems,
+          headerOrig,
+          headerNorm,
+          selection,
+          rowSelectionMap,
+          exportSelectedOnly,
+          includeTotalsRow
+        );
         const ws = XLSX.utils.aoa_to_sheet(rows);
-        XLSX.utils.book_append_sheet(wb, ws, (catName || "category").substring(0, 31));
+        XLSX.utils.book_append_sheet(
+          wb,
+          ws,
+          (catName || "category").substring(0, 31)
+        );
       }
       const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
       const blob = new Blob([wbout], { type: "application/octet-stream" });
@@ -832,7 +1320,10 @@ export default function Viewer() {
       URL.revokeObjectURL(url);
     } catch (err) {
       console.error("exportAllWithSelections", err);
-      setModalError({ title: "Export failed", message: err?.message || "Unable to export all categories." });
+      setModalError({
+        title: "Export failed",
+        message: err?.message || "Unable to export all categories.",
+      });
     } finally {
       setExportingAll(false);
     }
@@ -842,29 +1333,62 @@ export default function Viewer() {
     return (
       <tr>
         <th className="p-1 border-b text-center">
-          <input type="checkbox" checked={areAllRowsSelected()} onChange={() => setAllRowsSelectedForActive(!areAllRowsSelected())} className="cursor-pointer" />
+          <input
+            type="checkbox"
+            checked={areAllRowsSelected()}
+            onChange={() => setAllRowsSelectedForActive(!areAllRowsSelected())}
+            className="cursor-pointer"
+          />
         </th>
         <th className="p-1 border-b text-center">
-          <input type="checkbox" checked={Boolean(selection["id"])} onChange={() => toggleColumnForActive("id")} className="cursor-pointer" />
+          <input
+            type="checkbox"
+            checked={Boolean(selection["id"])}
+            onChange={() => toggleColumnForActive("id")}
+            className="cursor-pointer"
+          />
         </th>
         {headerOriginalOrder().map((h, i) => {
           const protectedCol = isProtectedColumn(h);
           const normArrLocal = headerNormalizedOrder();
           return (
-            <th key={`chk-${i}`} className="p-1 border-b text-center" onContextMenu={(e) => onHeaderCellContextMenu(e, i, h)}>
+            <th
+              key={`chk-${i}`}
+              className="p-1 border-b text-center"
+              onContextMenu={(e) => onHeaderCellContextMenu(e, i, h)}
+            >
               <div className="flex items-center justify-center gap-2">
-                <input type="checkbox" checked={Boolean(selection[normArrLocal[i]])} onChange={() => toggleColumnForActive(normArrLocal[i])} className="cursor-pointer" />
+                <input
+                  type="checkbox"
+                  checked={Boolean(selection[normArrLocal[i]])}
+                  onChange={() => toggleColumnForActive(normArrLocal[i])}
+                  className="cursor-pointer"
+                />
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    if (!protectedCol) setPendingDeleteColumn({ columnOrig: h, columnNorm: normArrLocal[i] });
+                    if (!protectedCol)
+                      setPendingDeleteColumn({
+                        columnOrig: h,
+                        columnNorm: normArrLocal[i],
+                      });
                   }}
-                  title={protectedCol ? `Cannot delete protected column "${h}"` : `Delete column "${h}"`}
-                  className={`ml-1 inline-flex items-center justify-center w-6 h-6 rounded-full ${protectedCol ? "text-gray-400 cursor-not-allowed" : "text-red-600 hover:bg-red-100"}`}
+                  title={
+                    protectedCol
+                      ? `Cannot delete protected column "${h}"`
+                      : `Delete column "${h}"`
+                  }
+                  className={`ml-1 inline-flex items-center justify-center w-6 h-6 rounded-full ${
+                    protectedCol
+                      ? "text-gray-400 cursor-not-allowed"
+                      : "text-red-600 hover:bg-red-100"
+                  }`}
                   disabled={protectedCol || deletingColumn}
                   type="button"
                 >
-                  {deletingColumn && pendingDeleteColumn && pendingDeleteColumn.columnOrig === h ? (
+                  {deletingColumn &&
+                  pendingDeleteColumn &&
+                  pendingDeleteColumn.columnOrig === h ? (
                     <Spinner className="h-4 w-4 text-red-600" />
                   ) : (
                     <Trash2 className="h-4 w-4" />
@@ -875,14 +1399,20 @@ export default function Viewer() {
           );
         })}
         <th className="p-1 border-b text-center">
-          <input type="checkbox" checked={Boolean(selection["total"])} onChange={() => toggleColumnForActive("total")} className="cursor-pointer" />
+          <input
+            type="checkbox"
+            checked={Boolean(selection["total"])}
+            onChange={() => toggleColumnForActive("total")}
+            className="cursor-pointer"
+          />
         </th>
       </tr>
     );
   }
 
   function renderTable() {
-    if (!items?.length) return <div className="text-sm text-gray-500">No items found</div>;
+    if (!items?.length)
+      return <div className="text-sm text-gray-500">No items found</div>;
     const orig = headerOriginalOrder();
     const normArr = headerNormalizedOrder();
     const selection = getSelectionForCategory(active, normArr);
@@ -895,15 +1425,28 @@ export default function Viewer() {
             {headerCheckboxRow(selection, normArr)}
             <tr>
               <th className="p-2 border-b border-r text-left w-12">Sel</th>
-              <th className="p-2 border-b border-r text-left w-56" onContextMenu={(e) => e.preventDefault()}>
+              <th
+                className="p-2 border-b border-r text-left w-56"
+                onContextMenu={(e) => e.preventDefault()}
+              >
                 ID
               </th>
               {orig.map((h, idx) => (
-                <th key={h} className="p-2 border-b border-r text-left" onContextMenu={(e) => onHeaderCellContextMenu(e, idx, h)} title={h}>
+                <th
+                  key={h}
+                  className="p-2 border-b border-r text-left"
+                  onContextMenu={(e) => onHeaderCellContextMenu(e, idx, h)}
+                  title={h}
+                >
                   {h}
                 </th>
               ))}
-              <th className="p-2 border-b text-left" onContextMenu={(e) => onHeaderCellContextMenu(e, orig.length, "Total")}>
+              <th
+                className="p-2 border-b text-left"
+                onContextMenu={(e) =>
+                  onHeaderCellContextMenu(e, orig.length, "Total")
+                }
+              >
                 Total
               </th>
             </tr>
@@ -911,16 +1454,22 @@ export default function Viewer() {
 
           <tbody>
             {items.map((it, rowIdx) => {
-              const map = (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
+              const map =
+                (rowSelectionByCategory && rowSelectionByCategory[active]) ||
+                {};
               const selected = map[it.ID] === undefined ? true : !!map[it.ID];
               return (
                 <tr
                   key={it.ID}
                   className="group odd:bg-white even:bg-gray-50 hover:bg-blue-50 transition-colors"
-                  onContextMenu={(e) => onBodyRowContextMenu(e, rowIdx, it.ID)}
                 >
                   <td className="p-2 border-r text-center">
-                    <input type="checkbox" checked={selected} onChange={() => toggleRowSelection(it.ID)} className="cursor-pointer" />
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      onChange={() => toggleRowSelection(it.ID)}
+                      className="cursor-pointer"
+                    />
                   </td>
 
                   <td className="relative p-2 border-r align-top font-mono text-xs bg-gray-100 group-hover:bg-blue-50">
@@ -930,17 +1479,38 @@ export default function Viewer() {
                   {orig.map((h, colIndex) => {
                     const nkey = normArr[colIndex] || String(h).toLowerCase();
                     const value = it[nkey];
-                    const isEditing = editingCell && editingCell.id === it.ID && editingCell.normKey === nkey;
+                    const imgObj = parseImageValue(value);
+                    const isEditing =
+                      editingCell &&
+                      editingCell.id === it.ID &&
+                      editingCell.normKey === nkey;
                     const savingKey = `${it.ID}|${nkey}`;
                     return (
                       <td
                         key={nkey}
                         className="relative p-2 border-r align-top whitespace-nowrap overflow-hidden"
                         onDoubleClick={() => startEdit(it.ID, nkey, value)}
+                        onContextMenu={(e) =>
+                          onBodyCellContextMenu(e, rowIdx, it.ID, nkey)
+                        }
+                        title={h}
                       >
                         {!isEditing && (
-                          <div className="text-xs leading-7 h-8 overflow-hidden truncate">
-                            {savingCellKey === savingKey ? (
+                          <div className="text-xs leading-7 h-8 overflow-hidden truncate flex items-center gap-2">
+                            {imgObj ? (
+                              <>
+                                <img
+                                  src={imgObj.src}
+                                  alt={imgObj.alt || h}
+                                  style={{
+                                    width: Math.min(64, imgObj.width || 64),
+                                    height: Math.min(64, imgObj.height || 64),
+                                    objectFit: "cover",
+                                    borderRadius: 4,
+                                  }}
+                                />
+                              </>
+                            ) : savingCellKey === savingKey ? (
                               <span className="text-indigo-600">Saving…</span>
                             ) : value === undefined || value === null ? (
                               ""
@@ -949,6 +1519,7 @@ export default function Viewer() {
                             )}
                           </div>
                         )}
+                        {/* CHANGE: Always allow inline editing editor, even if the cell currently contains an image JSON */}
                         {isEditing && (
                           <input
                             autoFocus
@@ -956,13 +1527,26 @@ export default function Viewer() {
                             onChange={(e) => setCellValue(e.target.value)}
                             onKeyDown={(e) => onInputKeyDown(e, it.ID, nkey)}
                             onBlur={() => {
-                              const original = editingCell ? (editingCell.original == null ? "" : String(editingCell.original)) : "";
-                              const incoming = cellValue == null ? "" : String(cellValue);
-                              if (incoming === original) cancelEdit();
-                              else saveEdit(it.ID, nkey, cellValue);
+                              const original = editingCell
+                                ? editingCell.original == null
+                                  ? ""
+                                  : String(editingCell.original)
+                                : "";
+                              const incoming =
+                                cellValue == null ? "" : String(cellValue);
+                              if (incoming === original) {
+                                cancelEdit();
+                              } else {
+                                // Save plain text to the cell (overwrites image JSON if present)
+                                saveEdit(it.ID, nkey, cellValue);
+                              }
                             }}
                             className="absolute inset-0 w-full h-full px-1 text-sm bg-white focus:outline-none box-border"
-                            style={{ padding: "4px 6px", border: "1px solid rgba(0,0,0,0.08)", borderRadius: 4 }}
+                            style={{
+                              padding: "4px 6px",
+                              border: "1px solid rgba(0,0,0,0.08)",
+                              borderRadius: 4,
+                            }}
                           />
                         )}
                       </td>
@@ -984,7 +1568,14 @@ export default function Viewer() {
               {orig.map((h, i) => {
                 const nkey = normArr[i] || String(h).toLowerCase();
                 const v = totals[nkey];
-                return <td key={`tot-${nkey}`} className="p-2 border-t border-r text-sm font-semibold">{v == null ? "" : String(v)}</td>;
+                return (
+                  <td
+                    key={`tot-${nkey}`}
+                    className="p-2 border-t border-r text-sm font-semibold"
+                  >
+                    {v == null ? "" : String(v)}
+                  </td>
+                );
               })}
               <td className="p-2 border-t text-sm font-semibold"></td>
             </tr>
@@ -996,7 +1587,11 @@ export default function Viewer() {
           <button
             onClick={onRequestDeleteSelectedRows}
             disabled={!anyRowSelected()}
-            className={`px-3 py-1 rounded bg-red-600 text-white ${!anyRowSelected() ? "opacity-60 cursor-not-allowed" : "hover:bg-red-700"}`}
+            className={`px-3 py-1 rounded bg-red-600 text-white ${
+              !anyRowSelected()
+                ? "opacity-60 cursor-not-allowed"
+                : "hover:bg-red-700"
+            }`}
           >
             Delete selected rows
           </button>
@@ -1005,13 +1600,20 @@ export default function Viewer() {
         {/* Context menus */}
         <ColumnContextMenu />
         <RowContextMenu />
+
+        {/* Modals */}
+        {InsertImageModal}
       </div>
     );
   }
 
   // Editing save helper
   async function saveEdit(id, normKey, newValue) {
-    const original = editingCell ? (editingCell.original == null ? "" : String(editingCell.original)) : "";
+    const original = editingCell
+      ? editingCell.original == null
+        ? ""
+        : String(editingCell.original)
+      : "";
     const incoming = newValue == null ? "" : String(newValue);
     if (incoming === original) {
       cancelEdit();
@@ -1031,17 +1633,29 @@ export default function Viewer() {
         throw new Error(txt || `Server ${res.status}`);
       }
       const json = await res.json();
-      setItems((prev) => prev.map((it) => (it.ID === id ? { ...it, [normKey]: incoming, ...(json.updated || {}) } : it)));
+      setItems((prev) =>
+        prev.map((it) =>
+          it.ID === id
+            ? { ...it, [normKey]: incoming, ...(json.updated || {}) }
+            : it
+        )
+      );
       cancelEdit();
     } catch (err) {
-      console.error("saveEdit", err);
-      setModalError({ title: "Save failed", message: err?.message || "Unable to save change." });
+      setModalError({
+        title: "Save failed",
+        message: err?.message || "Unable to save change.",
+      });
     } finally {
       setSavingCellKey(null);
     }
   }
   function startEdit(id, normKey, initial) {
-    setEditingCell({ id, normKey, original: initial == null ? "" : String(initial) });
+    setEditingCell({
+      id,
+      normKey,
+      original: initial == null ? "" : String(initial),
+    });
     setCellValue(initial == null ? "" : String(initial));
   }
   function cancelEdit() {
@@ -1061,8 +1675,16 @@ export default function Viewer() {
       <div className="flex gap-2 items-center">
         <button
           onClick={exportAllWithSelections}
-          className={`px-3 py-1 bg-indigo-600 text-white rounded flex items-center gap-2 ${exportingAll ? "opacity-70 cursor-wait" : "hover:bg-indigo-700"}`}
-          disabled={exportingAll || exportingCategory || deletingColumn || deletingRows || replacing}
+          className={`px-3 py-1 bg-indigo-600 text-white rounded flex items-center gap-2 ${
+            exportingAll ? "opacity-70 cursor-wait" : "hover:bg-indigo-700"
+          }`}
+          disabled={
+            exportingAll ||
+            exportingCategory ||
+            deletingColumn ||
+            deletingRows ||
+            replacing
+          }
         >
           {exportingAll ? <Spinner className="h-4 w-4 text-white" /> : null}
           <span>{exportingAll ? "Preparing…" : "Download All"}</span>
@@ -1070,20 +1692,47 @@ export default function Viewer() {
 
         <button
           onClick={() => active && exportCategoryWithSelection(active)}
-          disabled={!active || exportingCategory || exportingAll || deletingColumn || deletingRows || replacing}
-          className={`px-3 py-1 bg-green-600 text-white rounded flex items-center gap-2 ${!active || exportingCategory ? "opacity-70 cursor-not-allowed" : "hover:bg-green-700"}`}
+          disabled={
+            !active ||
+            exportingCategory ||
+            exportingAll ||
+            deletingColumn ||
+            deletingRows ||
+            replacing
+          }
+          className={`px-3 py-1 bg-green-600 text-white rounded flex items-center gap-2 ${
+            !active || exportingCategory
+              ? "opacity-70 cursor-not-allowed"
+              : "hover:bg-green-700"
+          }`}
         >
-          {exportingCategory ? <Spinner className="h-4 w-4 text-white" /> : null}
+          {exportingCategory ? (
+            <Spinner className="h-4 w-4 text-white" />
+          ) : null}
           <span>{exportingCategory ? "Preparing…" : "Download Category"}</span>
         </button>
 
         <button
           onClick={onReplaceAllClick}
           disabled={!active || replacing || deletingColumn || deletingRows}
-          className={`px-3 py-1 bg-red-600 text-white rounded ${!active || replacing ? "opacity-70 cursor-not-allowed" : "hover:bg-red-700"}`}
+          className={`px-3 py-1 bg-red-600 text-white rounded ${
+            !active || replacing
+              ? "opacity-70 cursor-not-allowed"
+              : "hover:bg-red-700"
+          }`}
         >
           {replacing ? <Spinner className="h-4 w-4 text-white" /> : null}
           <span>{replacing ? "Replacing…" : "Replace Category"}</span>
+        </button>
+
+        {/* Quick add column at end */}
+        <button
+          onClick={() => openInsertColumnAt(headerOriginalOrder().length)}
+          className="px-3 py-1 bg-indigo-600 text-white rounded flex items-center gap-2 hover:bg-indigo-700"
+          disabled={!active}
+        >
+          <Plus className="h-4 w-4" />
+          <span>Add column (end)</span>
         </button>
 
         <input
@@ -1104,7 +1753,10 @@ export default function Viewer() {
   }
   function onReplaceAllClick() {
     if (!active) {
-      setModalError({ title: "No category selected", message: "Select a category before replacing." });
+      setModalError({
+        title: "No category selected",
+        message: "Select a category before replacing.",
+      });
       return;
     }
     fileInputRef.current?.click();
@@ -1112,20 +1764,41 @@ export default function Viewer() {
 
   // ----------------- Modals -----------------
   const InsertColumnModal = insertColumnOpen ? (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => !insertingColumn && setInsertColumnOpen(false)}>
-      <div className="bg-white rounded-lg shadow-lg p-6 max-w-md w-full" onClick={(e) => e.stopPropagation()}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={() => !insertingColumn && setInsertColumnOpen(false)}
+    >
+      <div
+        className="bg-white rounded-lg shadow-lg p-6 max-w-md w-full"
+        onClick={(e) => e.stopPropagation()}
+      >
         <h3 className="text-lg font-semibold mb-2">Insert column</h3>
         <p className="text-sm text-gray-700 mb-4">
-          Add a new column at position {insertColumnIndex} for category <strong>{active}</strong>.
+          Add a new column at position {insertColumnIndex} for category{" "}
+          <strong>{active}</strong>.
         </p>
         <label className="block text-sm font-medium mb-1">Column name</label>
-        <input value={newColumnName} onChange={(e) => setNewColumnName(e.target.value)} className="w-full border rounded px-2 py-2 mb-3" placeholder="e.g., NewQuantity" />
+        <input
+          value={newColumnName}
+          onChange={(e) => setNewColumnName(e.target.value)}
+          className="w-full border rounded px-2 py-2 mb-3"
+          placeholder="e.g., NewQuantity"
+        />
         <div className="flex gap-2 justify-end">
-          <button onClick={() => setInsertColumnOpen(false)} className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300">
+          <button
+            onClick={() => setInsertColumnOpen(false)}
+            className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
+          >
             Cancel
           </button>
-          <button onClick={confirmInsertColumn} disabled={insertingColumn} className="px-3 py-1 rounded bg-indigo-600 text-white flex items-center gap-2 hover:bg-indigo-700">
-            {insertingColumn ? <Spinner className="h-4 w-4 text-white" /> : null}
+          <button
+            onClick={confirmInsertColumn}
+            disabled={insertingColumn}
+            className="px-3 py-1 rounded bg-indigo-600 text-white flex items-center gap-2 hover:bg-indigo-700"
+          >
+            {insertingColumn ? (
+              <Spinner className="h-4 w-4 text-white" />
+            ) : null}
             <span>{insertingColumn ? "Adding…" : "Insert column"}</span>
           </button>
         </div>
@@ -1134,11 +1807,18 @@ export default function Viewer() {
   ) : null;
 
   const InsertRowModal = insertRowOpen ? (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => !insertingRow && setInsertRowOpen(false)}>
-      <div className="bg-white rounded-lg shadow-lg p-6 max-w-xl w-full" onClick={(e) => e.stopPropagation()}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={() => !insertingRow && setInsertRowOpen(false)}
+    >
+      <div
+        className="bg-white rounded-lg shadow-lg p-6 max-w-xl w-full"
+        onClick={(e) => e.stopPropagation()}
+      >
         <h3 className="text-lg font-semibold mb-2">Insert row</h3>
         <p className="text-sm text-gray-700 mb-4">
-          Add a new row at position {insertRowIndex} for category <strong>{active}</strong>.
+          Add a new row at position {insertRowIndex} for category{" "}
+          <strong>{active}</strong>.
         </p>
 
         {/* ID field */}
@@ -1171,7 +1851,9 @@ export default function Viewer() {
           {newRowIdChecking ? (
             <span className="text-gray-600">Checking ID…</span>
           ) : newRowIdExists ? (
-            <span className="text-red-600">This ID already exists; choose a different ID.</span>
+            <span className="text-red-600">
+              This ID already exists; choose a different ID.
+            </span>
           ) : newRowId ? (
             <span className="text-green-700">ID available</span>
           ) : (
@@ -1179,19 +1861,26 @@ export default function Viewer() {
           )}
         </div>
 
-        {/* Fields */}
+        {/* Field inputs */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
           {headerNormalizedOrder()
-            .filter((nk) => nk !== "total" && nk !== "id" && nk !== "category")
+            .filter((nk) => !["total", "id", "category"].includes(nk))
             .map((nk) => {
-              const origIdx = headerNormalizedOrder().indexOf(nk);
-              const label = headerOriginalOrder()[origIdx] || nk;
+              const idx = headerNormalizedOrder().indexOf(nk);
+              const label = headerOriginalOrder()[idx] || nk;
               return (
                 <div key={nk}>
-                  <label className="block text-xs font-medium mb-1">{label}</label>
+                  <label className="block text-xs font-medium mb-1">
+                    {label}
+                  </label>
                   <input
                     value={newRowValues[nk] ?? ""}
-                    onChange={(e) => setNewRowValues((prev) => ({ ...prev, [nk]: e.target.value }))}
+                    onChange={(e) =>
+                      setNewRowValues((prev) => ({
+                        ...prev,
+                        [nk]: e.target.value,
+                      }))
+                    }
                     className="w-full border rounded px-2 py-2"
                     placeholder={`Enter ${label}`}
                   />
@@ -1201,7 +1890,10 @@ export default function Viewer() {
         </div>
 
         <div className="flex gap-2 justify-end">
-          <button onClick={() => setInsertRowOpen(false)} className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300">
+          <button
+            onClick={() => setInsertRowOpen(false)}
+            className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
+          >
             Cancel
           </button>
           <button
@@ -1224,7 +1916,8 @@ export default function Viewer() {
         <div>
           <h1 className="text-2xl font-semibold">Inventory Viewer</h1>
           <p className="text-sm text-gray-500 mt-1">
-            Right-click headers to Add column (left/right). Right-click a data row to Add row (top/bottom) or Delete row.
+            Right-click headers to Add column (left/right). Right-click a data
+            cell to Add row (top/bottom), Delete row, or Insert image.
           </p>
         </div>
         {headerControls()}
@@ -1237,8 +1930,20 @@ export default function Viewer() {
         ) : (
           <div className="flex gap-3 overflow-auto">
             {categories.map((c) => (
-              <div key={c.name} className={`flex items-center justify-between gap-2 px-3 py-1 rounded ${active === c.name ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-800"} hover:shadow-sm`} style={{ minWidth: 160, maxWidth: 320 }}>
-                <button onClick={() => setActive(c.name)} className="flex-1 text-left truncate" title={`Select category ${c.name}`}>
+              <div
+                key={c.name}
+                className={`flex items-center justify-between gap-2 px-3 py-1 rounded ${
+                  active === c.name
+                    ? "bg-blue-600 text-white"
+                    : "bg-gray-100 text-gray-800"
+                } hover:shadow-sm`}
+                style={{ minWidth: 160, maxWidth: 320 }}
+              >
+                <button
+                  onClick={() => setActive(c.name)}
+                  className="flex-1 text-left truncate"
+                  title={`Select category ${c.name}`}
+                >
                   {c.name}
                 </button>
                 <button
@@ -1261,12 +1966,19 @@ export default function Viewer() {
 
       <main>
         <div className="mb-4 relative">
-          <h2 className="text-lg font-medium mb-2">{active || "No category selected"}</h2>
-          {loadingItems ? <div className="text-sm text-gray-500">Loading items...</div> : renderTable()}
+          <h2 className="text-lg font-medium mb-2">
+            {active || "No category selected"}
+          </h2>
+          {loadingItems ? (
+            <div className="text-sm text-gray-500">Loading items...</div>
+          ) : (
+            renderTable()
+          )}
 
           {/* Modals */}
           {InsertColumnModal}
           {InsertRowModal}
+          {InsertImageModal}
 
           {/* Context menus */}
           <ColumnContextMenu />
@@ -1278,16 +1990,29 @@ export default function Viewer() {
       {pendingDeleteColumn && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">
           <div className="bg-white rounded-lg shadow-lg p-6 max-w-md w-full">
-            <h3 className="text-lg font-semibold mb-2">Delete column "{pendingDeleteColumn.columnOrig}"?</h3>
+            <h3 className="text-lg font-semibold mb-2">
+              Delete column "{pendingDeleteColumn.columnOrig}"?
+            </h3>
             <p className="text-sm text-gray-700 mb-4">
-              This will remove the column <strong>{pendingDeleteColumn.columnOrig}</strong> from all items in category <strong>{active}</strong>. This cannot be undone.
+              This will remove the column{" "}
+              <strong>{pendingDeleteColumn.columnOrig}</strong> from all items
+              in category <strong>{active}</strong>. This cannot be undone.
             </p>
             <div className="flex gap-2 justify-end">
-              <button onClick={() => setPendingDeleteColumn(null)} className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300">
+              <button
+                onClick={() => setPendingDeleteColumn(null)}
+                className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
+              >
                 Cancel
               </button>
-              <button onClick={confirmDeleteColumn} className="px-3 py-1 rounded bg-red-600 text-white flex items-center gap-2 hover:bg-red-700" disabled={deletingColumn}>
-                {deletingColumn ? <Spinner className="h-4 w-4 text-white" /> : null}
+              <button
+                onClick={confirmDeleteColumn}
+                className="px-3 py-1 rounded bg-red-600 text-white flex items-center gap-2 hover:bg-red-700"
+                disabled={deletingColumn}
+              >
+                {deletingColumn ? (
+                  <Spinner className="h-4 w-4 text-white" />
+                ) : null}
                 <span>{deletingColumn ? "Deleting…" : "Confirm Delete"}</span>
               </button>
             </div>
@@ -1295,13 +2020,17 @@ export default function Viewer() {
         </div>
       )}
 
-      {/* Delete selected rows modal */}
+      {/* Bulk Delete Rows Modal */}
       {confirmDeleteRowsOpen && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">
           <div className="bg-white rounded-lg shadow-lg p-6 max-w-md w-full">
-            <h3 className="text-lg font-semibold mb-2">Delete selected rows?</h3>
+            <h3 className="text-lg font-semibold mb-2">
+              Delete selected rows?
+            </h3>
             <p className="text-sm text-gray-700 mb-4">
-              This will permanently delete {pendingDeleteRowIds.length} rows from category <strong>{active}</strong>. The first data row and the totals row cannot be deleted.
+              This will permanently delete {pendingDeleteRowIds.length} rows
+              from category <strong>{active}</strong>. The first data row and
+              the totals row cannot be deleted.
             </p>
             <div className="flex gap-2 justify-end">
               <button
@@ -1313,38 +2042,19 @@ export default function Viewer() {
               >
                 Cancel
               </button>
-              <button onClick={confirmDeleteSelectedRows} disabled={deletingRows} className="px-3 py-1 rounded bg-red-600 text-white flex items-center gap-2 hover:bg-red-700">
-                {deletingRows ? <Spinner className="h-4 w-4 text-white" /> : null}
-                <span>{deletingRows ? "Deleting…" : `Delete ${pendingDeleteRowIds.length} rows`}</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Replace modal */}
-      {confirmReplaceOpen && pendingReplaceFile && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">
-          <div className="bg-white rounded-lg shadow-lg p-6 max-w-lg w-full">
-            <h3 className="text-lg font-semibold mb-2">Replace category "{active}"?</h3>
-            <p className="text-sm text-gray-700 mb-4">This will DELETE all items in category <strong>{active}</strong> and replace them with the contents of:</p>
-            <div className="mb-4">
-              <div className="text-sm font-medium">{pendingReplaceFile.name}</div>
-              <div className="text-xs text-gray-500">{Math.round(pendingReplaceFile.size / 1024)} KB</div>
-            </div>
-            <div className="flex gap-2 justify-end">
               <button
-                onClick={() => {
-                  setConfirmReplaceOpen(false);
-                  setPendingReplaceFile(null);
-                }}
-                className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
+                onClick={confirmDeleteSelectedRows}
+                disabled={deletingRows}
+                className="px-3 py-1 rounded bg-red-600 text-white flex items-center gap-2 hover:bg-red-700"
               >
-                Cancel
-              </button>
-              <button className="px-3 py-1 rounded bg-red-600 text-white flex items-center gap-2 hover:bg-red-700" disabled={replacing}>
-                {replacing ? <Spinner className="h-4 w-4 text-white" /> : null}
-                <span>{replacing ? "Replacing…" : "Confirm Replace"}</span>
+                {deletingRows ? (
+                  <Spinner className="h-4 w-4 text-white" />
+                ) : null}
+                <span>
+                  {deletingRows
+                    ? "Deleting…"
+                    : `Delete ${pendingDeleteRowIds.length} rows`}
+                </span>
               </button>
             </div>
           </div>
@@ -1353,12 +2063,23 @@ export default function Viewer() {
 
       {/* Error modal */}
       {modalError && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40" onClick={() => setModalError(null)}>
-          <div className="bg-white rounded-lg shadow-lg p-4 max-w-lg w-full" onClick={(e) => e.stopPropagation()}>
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
+          onClick={() => setModalError(null)}
+        >
+          <div
+            className="bg-white rounded-lg shadow-lg p-4 max-w-lg w-full"
+            onClick={(e) => e.stopPropagation()}
+          >
             <h3 className="font-semibold text-lg mb-2">{modalError.title}</h3>
-            <div className="text-sm text-gray-700 mb-4">{modalError.message}</div>
+            <div className="text-sm text-gray-700 mb-4">
+              {modalError.message}
+            </div>
             <div className="flex justify-end">
-              <button onClick={() => setModalError(null)} className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300">
+              <button
+                onClick={() => setModalError(null)}
+                className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
+              >
                 Close
               </button>
             </div>

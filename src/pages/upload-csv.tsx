@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
 import { isLocalHost } from "../api";
 
-const API_BASE = isLocalHost ? "http://localhost:3000" : 'http://qr-scanner-api.us-east-1.elasticbeanstalk.com'
+const API_BASE = isLocalHost ? "http://localhost:3000" : 'https://qr-inventory-scanner-backend.vercel.app'
 
 function Spinner({ className = "h-4 w-4 text-white" }) {
   return (

@@ -1086,16 +1086,6 @@ export default function Viewer() {
           <span>{replacing ? "Replacing…" : "Replace Category"}</span>
         </button>
 
-        {/* Quick add column at end */}
-        <button
-          onClick={() => openInsertColumnAt(headerOriginalOrder().length)}
-          className="px-3 py-1 bg-indigo-600 text-white rounded flex items-center gap-2 hover:bg-indigo-700"
-          disabled={!active}
-        >
-          <Plus className="h-4 w-4" />
-          <span>Add column (end)</span>
-        </button>
-
         <input
           ref={fileInputRef}
           type="file"

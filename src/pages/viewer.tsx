@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Trash2, Plus } from "lucide-react";
 import * as XLSX from "xlsx";
 import { isLocalHost } from "../api";
+import { v4 } from "uuid";
 
 const API_BASE = isLocalHost ? "http://localhost:8080" : "https://qr-inventory-scanner-backend.vercel.app";
 
@@ -14,7 +15,7 @@ const LS_COLS_KEY = "qr_viewer_col_selection_v1";
  *
  * Context menus:
  * - Right-click a header cell: "Add column (left/right)" (not on ID).
- * - All UI and logic for adding rows has been removed.
+ * - Right-click a data cell (tbody): "Add row (top/bottom)" and "Delete row".
  */
 
 function Spinner({ className = "h-4 w-4 text-white" }) {
@@ -23,7 +24,12 @@ function Spinner({ className = "h-4 w-4 text-white" }) {
       <circle className="opacity-25" cx="12" cy="12" r="10" strokeWidth="3" />
       <path className="opacity-75" d="M4 12a8 8 0 018-8" strokeWidth="3" strokeLinecap="round" />
     </svg>
-  );
+  )
+}
+
+// UUID v4 generator (frontend) for default ID
+function uuidv4() {
+  return v4
 }
 
 export default function Viewer() {
@@ -69,15 +75,26 @@ export default function Viewer() {
   const [insertColumnIndex, setInsertColumnIndex] = useState(0);
   const [insertingColumn, setInsertingColumn] = useState(false);
 
-  // Context menus (row context menu removed; only column menu remains)
+  // Insert row modal state
+  const [insertRowOpen, setInsertRowOpen] = useState(false);
+  const [insertRowIndex, setInsertRowIndex] = useState(0);
+  const [insertingRow, setInsertingRow] = useState(false);
+  const [newRowId, setNewRowId] = useState("");
+  const [newRowValues, setNewRowValues] = useState({});
+  const [newRowIdChecking, setNewRowIdChecking] = useState(false);
+  const [newRowIdExists, setNewRowIdExists] = useState(false);
+
+  // Context menus: supports 'column' and 'row'
   const [ctxMenu, setCtxMenu] = useState({
     open: false,
     x: 0,
     y: 0,
-    type: null, // 'column'
+    type: null, // 'column' | 'row'
     columnIndex: null,
     columnName: null,
     rowIndex: null,
+    rowId: null,
+    isHeaderCell: false,
   });
 
   // Close context menu on Escape or global click
@@ -96,7 +113,7 @@ export default function Viewer() {
     }
   }, [ctxMenu.open]);
 
-  // Per-category selections (persisted to localStorage)
+  // Persisted selections
   const [columnSelectionByCategory, setColumnSelectionByCategory] = useState(() => {
     try {
       const raw = window.localStorage.getItem(LS_COLS_KEY);
@@ -113,12 +130,9 @@ export default function Viewer() {
       return {};
     }
   });
-
-  // Export options per category (in-memory only)
   const [exportSelectedRowsOnlyByCategory, setExportSelectedRowsOnlyByCategory] = useState({});
   const [includeTotalsRowByCategory, setIncludeTotalsRowByCategory] = useState({});
 
-  // Persist selections when they change
   useEffect(() => {
     try {
       window.localStorage.setItem(LS_COLS_KEY, JSON.stringify(columnSelectionByCategory));
@@ -130,15 +144,12 @@ export default function Viewer() {
     } catch {}
   }, [rowSelectionByCategory]);
 
-  // Load categories on mount
+  // Load categories/items
   useEffect(() => {
     loadCategories();
-    // eslint-disable-next-line
   }, []);
-  // Load items whenever active changes
   useEffect(() => {
     if (active) loadCategoryItems(active);
-    // eslint-disable-next-line
   }, [active]);
 
   // ----------------- Backend calls -----------------
@@ -187,6 +198,28 @@ export default function Viewer() {
       setError(err?.message || "Failed to load items");
     } finally {
       setLoadingItems(false);
+    }
+  }
+
+  async function checkIdExists(id) {
+    if (!id || !String(id).trim()) {
+      setNewRowIdExists(false);
+      return false;
+    }
+    setNewRowIdChecking(true);
+    try {
+      const res = await fetch(`${API_BASE}/item/exists/${encodeURIComponent(id)}`);
+      const ok = res.ok;
+      const json = ok ? await res.json() : {};
+      const exists = !!json.exists;
+      setNewRowIdExists(exists);
+      return exists;
+    } catch (err) {
+      console.error("checkIdExists", err);
+      setNewRowIdExists(false);
+      return false;
+    } finally {
+      setNewRowIdChecking(false);
     }
   }
 
@@ -281,7 +314,7 @@ export default function Viewer() {
     return (items || []).some((it) => !!map[it.ID]);
   }
 
-  // ----------------- Delete rows -----------------
+  // ----------------- Delete rows bulk -----------------
   function onRequestDeleteSelectedRows() {
     if (!active) return;
     const map = (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
@@ -300,7 +333,9 @@ export default function Viewer() {
   }
   async function confirmDeleteSelectedRows() {
     if (!active || !pendingDeleteRowIds.length) {
-      setPendingDeleteRowIds([]); setConfirmDeleteRowsOpen(false); return;
+      setPendingDeleteRowIds([]);
+      setConfirmDeleteRowsOpen(false);
+      return;
     }
     setDeletingRows(true);
     try {
@@ -319,7 +354,8 @@ export default function Viewer() {
         setModalError({ title: "Delete incomplete", message: `Failed to delete ${failed.length} rows. See console.` });
       }
       await loadCategoryItems(active);
-      setPendingDeleteRowIds([]); setConfirmDeleteRowsOpen(false);
+      setPendingDeleteRowIds([]);
+      setConfirmDeleteRowsOpen(false);
     } catch (err) {
       console.error("confirmDeleteSelectedRows", err);
       setModalError({ title: "Delete failed", message: err?.message || "Unable to delete rows." });
@@ -411,12 +447,22 @@ export default function Viewer() {
     }
   }
 
-  // ----------------- Column header context menu -----------------
+  // ----------------- Context menus -----------------
   function onHeaderCellContextMenu(e, idx, label) {
     e.preventDefault();
     const isId = String(label || "").trim().toLowerCase() === "id";
     if (isId) return; // No menu for ID column
-    setCtxMenu({ open: true, x: e.clientX + 2, y: e.clientY + 2, type: "column", columnIndex: idx, columnName: label, rowIndex: null });
+    setCtxMenu({
+      open: true,
+      x: e.clientX + 2,
+      y: e.clientY + 2,
+      type: "column",
+      columnIndex: idx,
+      columnName: label,
+      rowIndex: null,
+      rowId: null,
+      isHeaderCell: true,
+    });
   }
   function ColumnContextMenu() {
     if (!ctxMenu.open || ctxMenu.type !== "column") return null;
@@ -437,6 +483,169 @@ export default function Viewer() {
         </button>
         <button className="w-full text-left px-3 py-2 hover:bg-gray-100" onClick={() => { setCtxMenu((p) => ({ ...p, open: false })); openInsertColumnAt(idx + 1); }}>
           Add column (right)
+        </button>
+      </div>
+    );
+  }
+
+  function onBodyRowContextMenu(e, rowIdx, rowId) {
+    e.preventDefault();
+    setCtxMenu({
+      open: true,
+      x: e.clientX + 2,
+      y: e.clientY + 2,
+      type: "row",
+      columnIndex: null,
+      columnName: null,
+      rowIndex: rowIdx,
+      rowId,
+      isHeaderCell: false,
+    });
+  }
+
+  function openInsertRowAt(index) {
+    setInsertRowIndex(index);
+    const headerNorm = headerNormalizedOrder();
+    const initValues = {};
+    for (const nk of headerNorm) {
+      if (nk === "total" || nk === "id" || nk === "category") continue;
+      initValues[nk] = "";
+    }
+    const defaultId = uuidv4();
+    setNewRowValues(initValues);
+    setNewRowId(defaultId);
+    setInsertRowOpen(true);
+    checkIdExists(defaultId);
+  }
+
+  async function confirmInsertRow() {
+    if (!active) return;
+    const id = String(newRowId || "").trim();
+    if (!id) {
+      setModalError({ title: "ID required", message: "Please enter an ID for the new row." });
+      return;
+    }
+    const exists = await checkIdExists(id);
+    if (exists) {
+      setModalError({ title: "ID already exists", message: `Another item with ID "${id}" already exists. Choose a different ID.` });
+      return;
+    }
+    setInsertingRow(true);
+    try {
+      const headerNorm = headerNormalizedOrder();
+      const values = {};
+      for (const nk of headerNorm) {
+        if (nk === "total" || nk === "id" || nk === "category") continue;
+        const v = newRowValues[nk];
+        values[nk] = v === "" ? null : v;
+      }
+
+      const res = await fetch(`${API_BASE}/category/${encodeURIComponent(active)}/row`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ insertIndex: insertRowIndex, id, values }),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(txt || `Server responded ${res.status}`);
+      }
+      const json = await res.json();
+      const created = json.item || null;
+      if (!created) {
+        await loadCategoryItems(active);
+        setInsertRowOpen(false);
+        return;
+      }
+
+      setItems((prev) => {
+        const next = prev.slice();
+        next.splice(insertRowIndex, 0, created);
+        return next;
+      });
+      setRowSelectionByCategory((prev) => {
+        const map = (prev && prev[active]) || {};
+        return { ...prev, [active]: { ...map, [created.ID]: true } };
+      });
+      setInsertRowOpen(false);
+    } catch (err) {
+      console.error("confirmInsertRow", err);
+      setModalError({ title: "Add row failed", message: err?.message || "Unable to add row." });
+    } finally {
+      setInsertingRow(false);
+    }
+  }
+
+  // NEW: Delete a single row from row context menu
+  async function deleteRowById(id) {
+    if (!id) return;
+    // prevent deleting first row as per existing policy
+    const firstId = items[0] ? items[0].ID : null;
+    if (id === firstId) {
+      setModalError({ title: "Cannot delete first row", message: "The first data row is protected and cannot be deleted." });
+      return;
+    }
+    setDeletingRows(true);
+    try {
+      const res = await fetch(`${API_BASE}/item/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(txt || `Server responded ${res.status}`);
+      }
+      // Remove locally for snappier UX, then optionally reload
+      setItems((prev) => prev.filter((it) => it.ID !== id));
+      setRowSelectionByCategory((prev) => {
+        const map = (prev && prev[active]) || {};
+        const nextMap = { ...map };
+        delete nextMap[id];
+        return { ...prev, [active]: nextMap };
+      });
+    } catch (err) {
+      console.error("deleteRowById", err);
+      setModalError({ title: "Delete failed", message: err?.message || "Unable to delete row." });
+    } finally {
+      setDeletingRows(false);
+      setCtxMenu((p) => ({ ...p, open: false }));
+    }
+  }
+
+  function RowContextMenu() {
+    if (!ctxMenu.open || ctxMenu.type !== "row" || ctxMenu.isHeaderCell) return null;
+    const idx = ctxMenu.rowIndex ?? 0;
+    const rowId = ctxMenu.rowId;
+    return (
+      <div
+        className="fixed z-50 bg-white border border-gray-300 rounded shadow-lg"
+        style={{ top: ctxMenu.y, left: ctxMenu.x, minWidth: 220 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-3 py-2 text-xs text-gray-500">Row #{idx + 1}</div>
+        <button
+          className="w-full text-left px-3 py-2 hover:bg-gray-100"
+          onClick={() => {
+            setCtxMenu((p) => ({ ...p, open: false }));
+            openInsertRowAt(idx);
+          }}
+          disabled={insertingRow}
+        >
+          Add row (top)
+        </button>
+        <button
+          className="w-full text-left px-3 py-2 hover:bg-gray-100"
+          onClick={() => {
+            setCtxMenu((p) => ({ ...p, open: false }));
+            openInsertRowAt(idx + 1);
+          }}
+          disabled={insertingRow}
+        >
+          Add row (bottom)
+        </button>
+        <div className="border-t my-1" />
+        <button
+          className="w-full text-left px-3 py-2 hover:bg-red-50 text-red-700"
+          onClick={() => deleteRowById(rowId)}
+          disabled={deletingRows}
+        >
+          {deletingRows ? "Deleting…" : "Delete row"}
         </button>
       </div>
     );
@@ -489,7 +698,7 @@ export default function Viewer() {
     map["total"] = true;
     return map;
   }
-  function buildRowsForExport(itemsArr, headerOrig, headerNorm, selection, rowSelectionMap, exportSelectedOnly, includeTotalsRow) {
+   function buildRowsForExport(itemsArr, headerOrig, headerNorm, selection, rowSelectionMap, exportSelectedOnly, includeTotalsRow) {
     let filteredItems = itemsArr;
     if (exportSelectedOnly && rowSelectionMap) filteredItems = itemsArr.filter((it) => !!rowSelectionMap[it.ID]);
 
@@ -629,7 +838,6 @@ export default function Viewer() {
     }
   }
 
-  // ----------------- Render helpers -----------------
   function headerCheckboxRow(selection, normArr) {
     return (
       <tr>
@@ -641,14 +849,15 @@ export default function Viewer() {
         </th>
         {headerOriginalOrder().map((h, i) => {
           const protectedCol = isProtectedColumn(h);
+          const normArrLocal = headerNormalizedOrder();
           return (
             <th key={`chk-${i}`} className="p-1 border-b text-center" onContextMenu={(e) => onHeaderCellContextMenu(e, i, h)}>
               <div className="flex items-center justify-center gap-2">
-                <input type="checkbox" checked={Boolean(selection[normArr[i]])} onChange={() => toggleColumnForActive(normArr[i])} className="cursor-pointer" />
+                <input type="checkbox" checked={Boolean(selection[normArrLocal[i]])} onChange={() => toggleColumnForActive(normArrLocal[i])} className="cursor-pointer" />
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    if (!protectedCol) setPendingDeleteColumn({ columnOrig: h, columnNorm: normArr[i] });
+                    if (!protectedCol) setPendingDeleteColumn({ columnOrig: h, columnNorm: normArrLocal[i] });
                   }}
                   title={protectedCol ? `Cannot delete protected column "${h}"` : `Delete column "${h}"`}
                   className={`ml-1 inline-flex items-center justify-center w-6 h-6 rounded-full ${protectedCol ? "text-gray-400 cursor-not-allowed" : "text-red-600 hover:bg-red-100"}`}
@@ -705,7 +914,11 @@ export default function Viewer() {
               const map = (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
               const selected = map[it.ID] === undefined ? true : !!map[it.ID];
               return (
-                <tr key={it.ID} className="group odd:bg-white even:bg-gray-50 hover:bg-blue-50 transition-colors">
+                <tr
+                  key={it.ID}
+                  className="group odd:bg-white even:bg-gray-50 hover:bg-blue-50 transition-colors"
+                  onContextMenu={(e) => onBodyRowContextMenu(e, rowIdx, it.ID)}
+                >
                   <td className="p-2 border-r text-center">
                     <input type="checkbox" checked={selected} onChange={() => toggleRowSelection(it.ID)} className="cursor-pointer" />
                   </td>
@@ -791,6 +1004,7 @@ export default function Viewer() {
 
         {/* Context menus */}
         <ColumnContextMenu />
+        <RowContextMenu />
       </div>
     );
   }
@@ -929,6 +1143,90 @@ export default function Viewer() {
     </div>
   ) : null;
 
+  const InsertRowModal = insertRowOpen ? (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => !insertingRow && setInsertRowOpen(false)}>
+      <div className="bg-white rounded-lg shadow-lg p-6 max-w-xl w-full" onClick={(e) => e.stopPropagation()}>
+        <h3 className="text-lg font-semibold mb-2">Insert row</h3>
+        <p className="text-sm text-gray-700 mb-4">
+          Add a new row at position {insertRowIndex} for category <strong>{active}</strong>.
+        </p>
+
+        {/* ID field */}
+        <label className="block text-sm font-medium mb-1">ID</label>
+        <div className="flex items-center gap-2 mb-3">
+          <input
+            value={newRowId}
+            onChange={(e) => {
+              const v = e.target.value;
+              setNewRowId(v);
+              checkIdExists(v);
+            }}
+            placeholder="Enter a unique ID (UUID pre-filled)"
+            className="flex-1 border rounded px-2 py-2"
+          />
+          <button
+            type="button"
+            onClick={() => {
+              const v = uuidv4();
+              setNewRowId(v);
+              checkIdExists(v);
+            }}
+            className="px-2 py-2 bg-gray-200 rounded hover:bg-gray-300 text-sm"
+            title="Generate UUID"
+          >
+            Generate
+          </button>
+        </div>
+        <div className="text-xs mb-4">
+          {newRowIdChecking ? (
+            <span className="text-gray-600">Checking ID…</span>
+          ) : newRowIdExists ? (
+            <span className="text-red-600">This ID already exists; choose a different ID.</span>
+          ) : newRowId ? (
+            <span className="text-green-700">ID available</span>
+          ) : (
+            <span className="text-gray-600">ID is required</span>
+          )}
+        </div>
+
+        {/* Fields */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+          {headerNormalizedOrder()
+            .filter((nk) => nk !== "total" && nk !== "id" && nk !== "category")
+            .map((nk) => {
+              const origIdx = headerNormalizedOrder().indexOf(nk);
+              const label = headerOriginalOrder()[origIdx] || nk;
+              return (
+                <div key={nk}>
+                  <label className="block text-xs font-medium mb-1">{label}</label>
+                  <input
+                    value={newRowValues[nk] ?? ""}
+                    onChange={(e) => setNewRowValues((prev) => ({ ...prev, [nk]: e.target.value }))}
+                    className="w-full border rounded px-2 py-2"
+                    placeholder={`Enter ${label}`}
+                  />
+                </div>
+              );
+            })}
+        </div>
+
+        <div className="flex gap-2 justify-end">
+          <button onClick={() => setInsertRowOpen(false)} className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300">
+            Cancel
+          </button>
+          <button
+            onClick={confirmInsertRow}
+            disabled={insertingRow || !newRowId || newRowIdExists}
+            className="px-3 py-1 rounded bg-indigo-600 text-white flex items-center gap-2 hover:bg-indigo-700 disabled:opacity-70"
+          >
+            {insertingRow ? <Spinner className="h-4 w-4 text-white" /> : null}
+            <span>{insertingRow ? "Adding…" : "Insert row"}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   // ----------------- JSX -----------------
   return (
     <div className="max-w-7xl mx-auto p-4">
@@ -936,7 +1234,7 @@ export default function Viewer() {
         <div>
           <h1 className="text-2xl font-semibold">Inventory Viewer</h1>
           <p className="text-sm text-gray-500 mt-1">
-            Right-click headers to Add column (left/right).
+            Right-click headers to Add column (left/right). Right-click a data row to Add row (top/bottom) or Delete row.
           </p>
         </div>
         {headerControls()}
@@ -978,9 +1276,11 @@ export default function Viewer() {
 
           {/* Modals */}
           {InsertColumnModal}
+          {InsertRowModal}
 
           {/* Context menus */}
           <ColumnContextMenu />
+          <RowContextMenu />
         </div>
       </main>
 

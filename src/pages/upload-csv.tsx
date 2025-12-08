@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
 import { isLocalHost } from "../api";
 
-const API_BASE = isLocalHost ? "http://localhost:3000" : 'https://qr-inventory-scanner-backend.vercel.app'
+const API_BASE = isLocalHost ? "http://localhost:8080" : "https://qr-inventory-scanner-backend.vercel.app";
 
 function Spinner({ className = "h-4 w-4 text-white" }) {
   return (
@@ -14,45 +14,47 @@ function Spinner({ className = "h-4 w-4 text-white" }) {
 }
 
 /**
- * UploadCsv.jsx
- *
- * Fix included:
- * - When a file is selected, we parse it immediately.
- * - After parsing completes (success or failure), the hidden <input> value is cleared so selecting
- *   the same file again will fire the change event and trigger a re-parse.
- *
- * This prevents the "re-upload same file doesn't refetch" issue.
- *
- * All other functionality is the same as prior: visible Choose file button, automatic parse,
- * auto/manual category mode, apply, popups, spinners, etc.
+ * UploadCsv
+ * - Parses CSV/XLSX via backend /parse
+ * - Auto category mode uses sheet/tab names
+ * - Manual mode allows overriding categories per dataset
+ * - CLEARs file input value after parse to allow re-uploading same file
+ * - Shows preview JSON
+ * - Apply calls /parse with update/replace
+ * - Displays which column will be used as primary key (ID column if present; otherwise UUID)
  */
 
 export default function UploadCsv() {
-  const [file, setFile] = useState(null);
-
-  const [operation, setOperation] = useState("update"); // update | replace
-
-  const [categoryMode, setCategoryMode] = useState("manual"); // "auto" | "manual"
+  const [file, setFile] = useState<File | null>(null);
+  const [operation, setOperation] = useState<"update" | "replace">("update");
+  const [categoryMode, setCategoryMode] = useState<"auto" | "manual">("manual");
   const [canAutoCategory, setCanAutoCategory] = useState(false);
 
-  const [datasets, setDatasets] = useState([]); // { sheetName, headerOriginalOrder, rows, warnings }
-  const [selected, setSelected] = useState({}); // sheetName -> bool
-  const [categoryOverrides, setCategoryOverrides] = useState({}); // sheetName -> manual category name
+  const [datasets, setDatasets] = useState<
+    Array<{
+      sheetName: string;
+      headerOriginalOrder: string[];
+      rows: number;
+      warnings: string[];
+      primaryKeySource?: "column" | "uuid";
+      primaryKeyColumnName?: string | null;
+    }>
+  >([]);
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [categoryOverrides, setCategoryOverrides] = useState<Record<string, string>>({});
 
-  const [previewing, setPreviewing] = useState(false); // parsing/preview in progress
-  const [loadingApply, setLoadingApply] = useState(false); // apply in progress
-  const [responseJson, setResponseJson] = useState(null);
-  const [error, setError] = useState(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [loadingApply, setLoadingApply] = useState(false);
+  const [responseJson, setResponseJson] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  // Modal state for popup messages
   const [modalOpen, setModalOpen] = useState(false);
   const [modalTitle, setModalTitle] = useState("");
   const [modalMessage, setModalMessage] = useState("");
   const [modalSuccess, setModalSuccess] = useState(false);
 
-  const fileInputRef = useRef(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // When datasets change ensure selected map has entries
   useEffect(() => {
     if (datasets.length > 0) {
       setSelected((prev) => {
@@ -65,14 +67,13 @@ export default function UploadCsv() {
     }
   }, [datasets]);
 
-  // When switching to manual via UI, pre-fill overrides with sheet names for easy editing
   useEffect(() => {
     if (categoryMode === "manual" && datasets.length > 0) {
       setCategoryOverrides((prev) => {
         const next = { ...(prev || {}) };
         datasets.forEach((d) => {
           if (!(d.sheetName in next) || !next[d.sheetName]) {
-            next[d.sheetName] = d.sheetName; // default to sheet name for easy edit
+            next[d.sheetName] = d.sheetName;
           }
         });
         return next;
@@ -82,7 +83,6 @@ export default function UploadCsv() {
     }
   }, [categoryMode, datasets]);
 
-  // Clear form
   const clearAll = () => {
     setFile(null);
     setDatasets([]);
@@ -94,20 +94,16 @@ export default function UploadCsv() {
     setCategoryMode("manual");
   };
 
-  // helper to show modal
-  const showModal = (success, title, message) => {
+  const showModal = (success: boolean, title: string, message: string) => {
     setModalSuccess(!!success);
     setModalTitle(title);
     setModalMessage(message);
     setModalOpen(true);
   };
 
-  // Inspect file to determine auto-possible and then parse automatically
-  const handleFileButtonClick = () => {
-    fileInputRef.current?.click();
-  };
+  const handleFileButtonClick = () => fileInputRef.current?.click();
 
-  const handleFileChange = async (ev) => {
+  const handleFileChange = async (ev: React.ChangeEvent<HTMLInputElement>) => {
     setError(null);
     setResponseJson(null);
     setDatasets([]);
@@ -132,40 +128,31 @@ export default function UploadCsv() {
         const hasTabs = sheetCount > 1;
         setCanAutoCategory(hasTabs);
         setCategoryMode(hasTabs ? "auto" : "manual");
-      } catch (err) {
-        console.warn("Failed to inspect workbook:", err);
+      } catch {
         setCanAutoCategory(false);
         setCategoryMode("manual");
       }
     } else {
-      // CSV: cannot auto
       setCanAutoCategory(false);
       setCategoryMode("manual");
     }
 
-    // parse automatically. Ensure input is cleared after parse so re-selecting same file fires change.
     try {
       await parsePreviewWithAuto(f);
     } finally {
-      // CLEAR the actual <input> value so selecting the same file again triggers onChange.
-      // We keep `file` state so UI still shows selected file name.
       try {
         if (fileInputRef.current) fileInputRef.current.value = "";
-      } catch (e) {
-        // ignore
-      }
+      } catch {}
     }
   };
 
-  // parse/preview by calling backend /parse
-  const parsePreviewWithAuto = async (explicitFile) => {
+  const parsePreviewWithAuto = async (explicitFile?: File) => {
     setError(null);
     setResponseJson(null);
     setDatasets([]);
     setSelected({});
     setCategoryOverrides({});
     const f = explicitFile || file;
-
     if (!f) {
       const msg = "Please select a file.";
       setError(msg);
@@ -185,26 +172,30 @@ export default function UploadCsv() {
       const json = await res.json();
       setResponseJson(json);
 
-      if (json.datasets && Array.isArray(json.datasets)) {
-        const ds = json.datasets.map((d) => {
+      // Expect datasets: [{ sheetName, headerOriginalOrder, rows, warnings, idColumnUsed, idColumnName }]
+      if (Array.isArray(json.datasets)) {
+        const ds = json.datasets.map((d: any) => {
           const sheetName = d.sheetName || d.category || "dataset";
           const headers = Array.isArray(d.headerOriginalOrder) ? d.headerOriginalOrder : [];
+          const primaryKeySource: "column" | "uuid" = d.idColumnUsed ? "column" : "uuid";
+          const primaryKeyColumnName: string | null = d.idColumnName || null;
           return {
             sheetName,
             headerOriginalOrder: headers,
             rows: d.rows || 0,
             warnings: d.warnings || [],
+            primaryKeySource,
+            primaryKeyColumnName,
           };
         });
         setDatasets(ds);
 
-        // mark all as selected
-        const sel = {};
+        const sel: Record<string, boolean> = {};
         ds.forEach((d) => (sel[d.sheetName] = true));
         setSelected(sel);
 
         if (categoryMode === "manual") {
-          const ov = {};
+          const ov: Record<string, string> = {};
           ds.forEach((d) => (ov[d.sheetName] = d.sheetName));
           setCategoryOverrides(ov);
         } else {
@@ -213,9 +204,8 @@ export default function UploadCsv() {
       } else {
         setDatasets([]);
       }
-    } catch (err) {
-      console.error("parsePreview error:", err);
-      const msg = (err && err.message) || "Preview failed";
+    } catch (err: any) {
+      const msg = err?.message || "Preview failed";
       setError(msg);
       showModal(false, "Parsing failed", String(msg));
     } finally {
@@ -223,11 +213,12 @@ export default function UploadCsv() {
     }
   };
 
-  // toggles and setters
-  const toggleDatasetIncluded = (sheetName) => setSelected((s) => ({ ...(s || {}), [sheetName]: !s[sheetName] }));
-  const setCategoryOverride = (sheetName, value) => setCategoryOverrides((s) => ({ ...(s || {}), [sheetName]: value }));
+  const toggleDatasetIncluded = (sheetName: string) =>
+    setSelected((s) => ({ ...(s || {}), [sheetName]: !s[sheetName] }));
 
-  // validation & mapping
+  const setCategoryOverride = (sheetName: string, value: string) =>
+    setCategoryOverrides((s) => ({ ...(s || {}), [sheetName]: value }));
+
   const validateBeforeApply = () => {
     if (!datasets.length) return { ok: false, message: "No datasets available to apply." };
     const anySelected = Object.values(selected || {}).some(Boolean);
@@ -243,7 +234,7 @@ export default function UploadCsv() {
   };
 
   const buildCategoriesMapping = () => {
-    const mapping = {};
+    const mapping: Record<string, string> = {};
     for (const d of datasets) {
       if (!selected[d.sheetName]) continue;
       const cat = categoryMode === "auto" ? d.sheetName : (categoryOverrides[d.sheetName] || "").trim();
@@ -252,18 +243,15 @@ export default function UploadCsv() {
     return mapping;
   };
 
-  // apply (update/replace)
-  const apply = async ({ previewOnly = false }) => {
+  const apply = async ({ previewOnly = false }: { previewOnly?: boolean }) => {
     setError(null);
     setResponseJson(null);
-
     const v = validateBeforeApply();
     if (!v.ok) {
       setError(v.message);
       showModal(false, "Validation failed", v.message);
       return;
     }
-
     if (!file) {
       const msg = "No file selected";
       setError(msg);
@@ -290,12 +278,9 @@ export default function UploadCsv() {
       }
       const json = await res.json();
       setResponseJson(json);
-
-      // success — show popup and on OK clear form
       showModal(true, "Apply succeeded", "The operation completed successfully.");
-    } catch (err) {
-      console.error("apply error:", err);
-      const msg = (err && err.message) || "Apply failed";
+    } catch (err: any) {
+      const msg = err?.message || "Apply failed";
       setError(msg);
       showModal(false, "Apply failed", String(msg));
     } finally {
@@ -311,7 +296,6 @@ export default function UploadCsv() {
     await apply({ previewOnly: false });
   };
 
-  // When modal OK is clicked: if success then clear the form
   const onModalOk = () => {
     setModalOpen(false);
     if (modalSuccess) {
@@ -319,10 +303,9 @@ export default function UploadCsv() {
     }
   };
 
-  // "Edit categories" helper: switch to manual and prefill overrides
   const onEditCategories = () => {
     setCategoryMode("manual");
-    const ov = {};
+    const ov: Record<string, string> = {};
     datasets.forEach((d) => {
       ov[d.sheetName] = d.sheetName;
     });
@@ -334,20 +317,19 @@ export default function UploadCsv() {
     previewing ||
     datasets.length === 0 ||
     !Object.values(selected || {}).some(Boolean) ||
-    (categoryMode === "manual" && datasets.some((d) => selected[d.sheetName] && !(categoryOverrides[d.sheetName] || "").trim()));
+    (categoryMode === "manual" &&
+      datasets.some((d) => selected[d.sheetName] && !(categoryOverrides[d.sheetName] || "").trim()));
 
   return (
-    <div className="app-container max-w-3xl mx-auto p-4">
+    <div className="app-container max-w-5xl mx-auto p-4">
       <header className="mb-6">
         <h1 className="text-2xl font-semibold">Upload CSV / XLSX (category-aware)</h1>
-        <p className="text-sm text-gray-500 mt-1">Click "Choose file" to upload. Files parse automatically on upload.</p>
+        <p className="text-sm text-gray-500 mt-1">Choose a file to upload. Parsing and preview run automatically.</p>
       </header>
 
       <section className="bg-white rounded-lg shadow p-4 space-y-4">
-        {/* File input as hidden with visible button */}
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-2">Choose CSV / XLSX file</label>
-
+          <label className="block text-sm font-medium text-gray-700 mb-2">Choose .CSV or .XLSX file</label>
           <div className="flex items-center gap-3">
             <button
               type="button"
@@ -357,7 +339,6 @@ export default function UploadCsv() {
               <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 5v14M5 12h14" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
               Choose file
             </button>
-
             <div className="text-sm text-gray-700">
               {file ? (
                 <>
@@ -378,10 +359,9 @@ export default function UploadCsv() {
             className="hidden"
           />
 
-          <div className="mt-2 text-xs text-gray-500">Parsing & preview runs automatically after file selection.</div>
+          <div className="mt-2 text-xs text-gray-500">Parsing & preview run automatically after file selection.</div>
         </div>
 
-        {/* Operation */}
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-2">Operation</label>
           <div className="flex gap-3">
@@ -396,7 +376,6 @@ export default function UploadCsv() {
           </div>
         </div>
 
-        {/* Category mode */}
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-2">Category mode</label>
           <div className="flex gap-3 items-center">
@@ -418,11 +397,10 @@ export default function UploadCsv() {
           </div>
 
           <div className="text-xs text-gray-500 mt-2">
-            {canAutoCategory ? "Auto will use sheet names as categories when multiple sheets are present; use Edit categories to override." : "Auto not available for this file type — use Manual and provide category names."}
+            {canAutoCategory ? "Auto uses sheet names as categories when multiple sheets are present; use Edit categories to override." : "Auto not available for this file type — use Manual and provide category names."}
           </div>
         </div>
 
-        {/* Parsing indicator */}
         {previewing && (
           <div className="p-3 bg-gray-50 rounded text-sm flex items-center gap-2">
             <Spinner className="h-4 w-4 text-gray-700" />
@@ -430,7 +408,6 @@ export default function UploadCsv() {
           </div>
         )}
 
-        {/* Datasets */}
         {datasets.length > 0 && (
           <div className="mt-4">
             <h3 className="text-lg font-medium">Datasets found</h3>
@@ -454,7 +431,6 @@ export default function UploadCsv() {
 
                         <div className="mt-2 flex gap-2 items-center">
                           <label className="text-sm text-gray-700">Category:</label>
-
                           {categoryMode === "auto" ? (
                             <input value={d.sheetName} readOnly className="p-1 border rounded text-sm bg-gray-50" />
                           ) : (
@@ -465,8 +441,17 @@ export default function UploadCsv() {
                               className="p-1 border rounded text-sm"
                             />
                           )}
+                          <div className="ml-4 text-xs text-gray-600">
+                            Headers: {d.headerOriginalOrder?.slice(0, 6).join(", ")}
+                            {(d.headerOriginalOrder?.length || 0) > 6 ? "…" : ""}
+                          </div>
+                        </div>
 
-                          <div className="ml-4 text-xs text-gray-600">Headers: {d.headerOriginalOrder?.slice(0, 6).join(", ")}{(d.headerOriginalOrder?.length || 0) > 6 ? "…" : ""}</div>
+                        <div className="mt-2 text-xs text-gray-600">
+                          Primary key:{" "}
+                          {d.primaryKeySource === "column"
+                            ? `ID column "${d.primaryKeyColumnName}"`
+                            : "Auto-generated UUID (no Id/ID column found)"}
                         </div>
                       </div>
                     </div>
@@ -492,12 +477,12 @@ export default function UploadCsv() {
           </div>
         )}
 
-        {/* Apply area */}
         <div className="mt-6 border-t pt-4">
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-sm text-gray-700">After confirming datasets and categories, click Apply to run the selected operation on the server.</div>
-              {categoryMode === "manual" && datasets.some((d) => selected[d.sheetName] && !(categoryOverrides[d.sheetName] || "").trim()) ? (
+              {categoryMode === "manual" &&
+                datasets.some((d) => selected[d.sheetName] && !(categoryOverrides[d.sheetName] || "").trim()) ? (
                 <div className="mt-2 text-xs text-red-600">Please fill all category names for selected datasets before applying.</div>
               ) : null}
             </div>
@@ -520,7 +505,6 @@ export default function UploadCsv() {
         </div>
       </section>
 
-      {/* Modal Popup */}
       {modalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
           <div className="bg-white rounded-lg shadow-lg p-6 max-w-lg w-full">

@@ -1,3 +1,23 @@
+import React, {
+  useEffect,
+  useRef,
+  useState,
+  useMemo,
+  useCallback,
+} from "react";
+import {
+  Trash2,
+  Plus,
+  Image as ImageIcon,
+  Minus,
+  Plus as PlusIcon,
+} from "lucide-react";
+// You can remove SheetJS entirely if not used elsewhere
+// import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
+import { saveAs } from "file-saver";
+import { isLocalHost } from "../api";
+
 /* Performance refactor v2 (height scaling via transform):
    - Column width: smooth via CSS variables and requestAnimationFrame (as before).
    - Image column height: animated via transform: scaleY on a fixed-height container (GPU-friendly, avoids layout reflow).
@@ -5,11 +25,6 @@
    - Images auto-fit (width/height "auto"); <img> uses decoding="async" and loading="lazy".
    - Existing functionality preserved (context menus, insert/delete, export, etc.).
 */
-
-import React, { useEffect, useRef, useState, useMemo, useCallback } from "react";
-import { Trash2, Plus, Image as ImageIcon, Minus, Plus as PlusIcon } from "lucide-react";
-import * as XLSX from "xlsx";
-import { isLocalHost } from "../api";
 
 const API_BASE = isLocalHost
   ? "http://localhost:8080"
@@ -50,27 +65,40 @@ function uuidv4() {
 }
 
 // Parse image JSON
-function parseImageValue(val) {
+type ImageCell = {
+  type: "image";
+  src: string;
+  alt?: string;
+  width?: string;
+  height?: string;
+  s3Key?: string;
+};
+function parseImageValue(val: unknown): ImageCell | null {
   if (!val || typeof val !== "string") return null;
   try {
     const obj = JSON.parse(val);
-    if (obj && obj.type === "image" && obj.src) return obj;
+    if (obj && obj.type === "image" && typeof obj.src === "string") return obj;
   } catch {}
   return null;
 }
 
 // Utils
-function norm(s) {
-  return String(s || "").trim().toLowerCase();
+function norm(s: unknown) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase();
 }
 
 // Debounce helper
-function useDebouncedCallback(fn, delay) {
-  const timerRef = useRef(null);
+function useDebouncedCallback<T extends (...args: any[]) => void>(
+  fn: T,
+  delay: number
+) {
+  const timerRef = useRef<number | null>(null);
   return useCallback(
-    (...args) => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-      timerRef.current = setTimeout(() => {
+    (...args: Parameters<T>) => {
+      if (timerRef.current) window.clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => {
         timerRef.current = null;
         fn(...args);
       }, delay);
@@ -79,12 +107,53 @@ function useDebouncedCallback(fn, delay) {
   );
 }
 
+// Numeric coercion for Excel cells
+function toNumberIfNumeric(val: unknown): number | string | null {
+  if (val === null || val === undefined) return null;
+  if (typeof val === "number" && Number.isFinite(val)) return val;
+  const s = String(val).trim();
+  if (s === "") return "";
+  // Allow comma decimal separator (e.g., "12,34")
+  const normalized = s.replace(",", ".");
+  const n = Number(normalized);
+  return Number.isFinite(n) ? n : s;
+}
+
+// Pixels per inch and min image width rules
+const PX_PER_INCH = 96;
+const MIN_IMAGE_WIDTH_INCHES = 2.0;
+const MIN_IMAGE_WIDTH_PX = Math.round(MIN_IMAGE_WIDTH_INCHES * PX_PER_INCH);
+
+// Excel column width conversions (~7.5 px per "character" width)
+function charsToPx(chars: number) {
+  return Math.round((chars || 10) * 7.5);
+}
+function pxToChars(px: number) {
+  return Math.max(6, Math.round(px / 7.5));
+}
+
+// Decode image intrinsic dimensions using createImageBitmap for aspect ratio
+async function getImageDimensionsFromBuffer(
+  ab: ArrayBuffer
+): Promise<{ width: number; height: number } | null> {
+  try {
+    const blob = new Blob([ab]);
+    const bitmap = await createImageBitmap(blob);
+    const dims = { width: bitmap.width, height: bitmap.height };
+    bitmap.close?.();
+    return dims;
+  } catch (e) {
+    console.warn("getImageDimensionsFromBuffer failed", e);
+    return null;
+  }
+}
+
 export default function Viewer() {
   // Data
-  const [categories, setCategories] = useState([]);
-  const [active, setActive] = useState(null);
-  const [items, setItems] = useState([]);
-  const [schema, setSchema] = useState(null);
+  const [categories, setCategories] = useState<Array<{ name: string }>>([]);
+  const [active, setActive] = useState<string | null>(null);
+  const [items, setItems] = useState<any[]>([]);
+  const [schema, setSchema] = useState<any | null>(null);
 
   // UI flags
   const [loadingCats, setLoadingCats] = useState(false);
@@ -92,25 +161,39 @@ export default function Viewer() {
   const [replacing, setReplacing] = useState(false);
   const [deletingColumn, setDeletingColumn] = useState(false);
   const [deletingRows, setDeletingRows] = useState(false);
-  const [deletingCategory, setDeletingCategory] = useState(false);
+  const [deletingCategory, setDeletingCategory] = useState<string | false>(
+    false
+  );
   const [exportingCategory, setExportingCategory] = useState(false);
   const [exportingAll, setExportingAll] = useState(false);
-  const [error, setError] = useState(null);
-  const [modalError, setModalError] = useState(null);
+  const [error, setError] = useState<string | null>(null);
+  const [modalError, setModalError] = useState<{
+    title: string;
+    message: string;
+  } | null>(null);
 
   // Editing state
-  const [editingCell, setEditingCell] = useState(null);
+  const [editingCell, setEditingCell] = useState<{
+    id: string;
+    normKey: string;
+    original: string;
+  } | null>(null);
   const [cellValue, setCellValue] = useState("");
-  const [savingCellKey, setSavingCellKey] = useState(null);
+  const [savingCellKey, setSavingCellKey] = useState<string | null>(null);
 
   // File/replace
-  const fileInputRef = useRef(null);
-  const [pendingReplaceFile, setPendingReplaceFile] = useState(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [pendingReplaceFile, setPendingReplaceFile] = useState<File | null>(
+    null
+  );
   const [confirmReplaceOpen, setConfirmReplaceOpen] = useState(false);
 
   // Column/Row delete modals
-  const [pendingDeleteColumn, setPendingDeleteColumn] = useState(null);
-  const [pendingDeleteRowIds, setPendingDeleteRowIds] = useState([]);
+  const [pendingDeleteColumn, setPendingDeleteColumn] = useState<{
+    columnOrig: string;
+    columnNorm: string;
+  } | null>(null);
+  const [pendingDeleteRowIds, setPendingDeleteRowIds] = useState<string[]>([]);
   const [confirmDeleteRowsOpen, setConfirmDeleteRowsOpen] = useState(false);
 
   // Insert column/row modals
@@ -123,26 +206,60 @@ export default function Viewer() {
   const [insertRowIndex, setInsertRowIndex] = useState(0);
   const [insertingRow, setInsertingRow] = useState(false);
   const [newRowId, setNewRowId] = useState("");
-  const [newRowValues, setNewRowValues] = useState({});
+  const [newRowValues, setNewRowValues] = useState<Record<string, string>>({});
   const [newRowIdChecking, setNewRowIdChecking] = useState(false);
   const [newRowIdExists, setNewRowIdExists] = useState(false);
 
   // Insert image modal
   const [insertImageOpen, setInsertImageOpen] = useState(false);
-  const [insertImageTarget, setInsertImageTarget] = useState(null); // { id, normKey }
-  const [imageUploadMode, setImageUploadMode] = useState("upload"); // 'upload' | 'url'
-  const [imageFile, setImageFile] = useState(null);
+  const [insertImageTarget, setInsertImageTarget] = useState<{
+    id: string;
+    normKey: string;
+  } | null>(null); // { id, normKey }
+  const [imageUploadMode, setImageUploadMode] = useState<"upload" | "url">(
+    "upload"
+  );
+  const [imageFile, setImageFile] = useState<File | null>(null);
   const [imageUrl, setImageUrl] = useState("");
   const [imageAlt, setImageAlt] = useState("");
   const [uploadingImage, setUploadingImage] = useState(false);
   const [imagePreviewUrl, setImagePreviewUrl] = useState("");
+  const [imageWidth, setImageWidth] = useState(64);
+  const [imageHeight, setImageHeight] = useState(64);
+
+  // Image columns autodetect (typed)
+  const imageColumns = useMemo<Set<string>>(() => {
+    const norm = headerNormalizedOrder();
+    const set = new Set<string>();
+    for (const nk of norm) {
+      for (const it of items || []) {
+        const img = parseImageValue(it[nk]);
+        if (img) {
+          set.add(nk);
+          break;
+        }
+      }
+    }
+    return set;
+  }, [items, schema]);
 
   // Context menu
-  const [ctxMenu, setCtxMenu] = useState({
+  const [ctxMenu, setCtxMenu] = useState<{
+    open: boolean;
+    x: number;
+    y: number;
+    type: "column" | "row" | null;
+    columnIndex: number | null;
+    columnName: string | null;
+    rowIndex: number | null;
+    rowId: string | null;
+    isHeaderCell: boolean;
+    cellNormKey: string | null;
+  }>({
     open: false,
     x: 0,
     y: 0,
-    type: null, // 'column' | 'row'
+    type: null,
     columnIndex: null,
     columnName: null,
     rowIndex: null,
@@ -152,17 +269,19 @@ export default function Viewer() {
   });
 
   // Selections
-  const [columnSelectionByCategory, setColumnSelectionByCategory] = useState(
-    () => {
-      try {
-        const raw = window.localStorage.getItem(LS_COLS_KEY);
-        return raw ? JSON.parse(raw) : {};
-      } catch {
-        return {};
-      }
+  const [columnSelectionByCategory, setColumnSelectionByCategory] = useState<
+    Record<string, Record<string, boolean>>
+  >(() => {
+    try {
+      const raw = window.localStorage.getItem(LS_COLS_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
     }
-  );
-  const [rowSelectionByCategory, setRowSelectionByCategory] = useState(() => {
+  });
+  const [rowSelectionByCategory, setRowSelectionByCategory] = useState<
+    Record<string, Record<string, boolean>>
+  >(() => {
     try {
       const raw = window.localStorage.getItem(LS_ROWS_KEY);
       return raw ? JSON.parse(raw) : {};
@@ -173,10 +292,10 @@ export default function Viewer() {
   const [
     exportSelectedRowsOnlyByCategory,
     setExportSelectedRowsOnlyByCategory,
-  ] = useState({});
-  const [includeTotalsRowByCategory, setIncludeTotalsRowByCategory] = useState(
-    {}
-  );
+  ] = useState<Record<string, boolean>>({});
+  const [includeTotalsRowByCategory, setIncludeTotalsRowByCategory] = useState<
+    Record<string, boolean>
+  >({});
 
   useEffect(() => {
     try {
@@ -196,7 +315,9 @@ export default function Viewer() {
   }, [rowSelectionByCategory]);
 
   // Column widths and row heights (persisted)
-  const [colWidthsByCategory, setColWidthsByCategory] = useState(() => {
+  const [colWidthsByCategory, setColWidthsByCategory] = useState<
+    Record<string, number[]>
+  >(() => {
     try {
       const raw = window.localStorage.getItem(LS_COL_WIDTHS_KEY);
       return raw ? JSON.parse(raw) : {};
@@ -204,7 +325,9 @@ export default function Viewer() {
       return {};
     }
   });
-  const [rowHeightsByCategory, setRowHeightsByCategory] = useState(() => {
+  const [rowHeightsByCategory, setRowHeightsByCategory] = useState<
+    Record<string, Record<string, number>>
+  >(() => {
     try {
       const raw = window.localStorage.getItem(LS_ROW_HEIGHTS_KEY);
       return raw ? JSON.parse(raw) : {};
@@ -212,37 +335,46 @@ export default function Viewer() {
       return {};
     }
   });
-  const [imageColHeightsByCategory, setImageColHeightsByCategory] = useState(
-    () => {
-      try {
-        const raw = window.localStorage.getItem(LS_IMAGE_COL_HEIGHTS_KEY);
-        return raw ? JSON.parse(raw) : {};
-      } catch {
-        return {};
-      }
+  const [imageColHeightsByCategory, setImageColHeightsByCategory] = useState<
+    Record<string, Record<string, number>>
+  >(() => {
+    try {
+      const raw = window.localStorage.getItem(LS_IMAGE_COL_HEIGHTS_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
     }
+  });
+
+  const persistColWidthsDebounced = useDebouncedCallback(
+    (next: Record<string, number[]>) => {
+      try {
+        window.localStorage.setItem(LS_COL_WIDTHS_KEY, JSON.stringify(next));
+      } catch {}
+    },
+    200
   );
 
-  const persistColWidthsDebounced = useDebouncedCallback((next) => {
-    try {
-      window.localStorage.setItem(LS_COL_WIDTHS_KEY, JSON.stringify(next));
-    } catch {}
-  }, 200);
+  const persistRowHeightsDebounced = useDebouncedCallback(
+    (next: Record<string, Record<string, number>>) => {
+      try {
+        window.localStorage.setItem(LS_ROW_HEIGHTS_KEY, JSON.stringify(next));
+      } catch {}
+    },
+    200
+  );
 
-  const persistRowHeightsDebounced = useDebouncedCallback((next) => {
-    try {
-      window.localStorage.setItem(LS_ROW_HEIGHTS_KEY, JSON.stringify(next));
-    } catch {}
-  }, 200);
-
-  const persistImageColHeightsDebounced = useDebouncedCallback((next) => {
-    try {
-      window.localStorage.setItem(
-        LS_IMAGE_COL_HEIGHTS_KEY,
-        JSON.stringify(next)
-      );
-    } catch {}
-  }, 200);
+  const persistImageColHeightsDebounced = useDebouncedCallback(
+    (next: Record<string, Record<string, number>>) => {
+      try {
+        window.localStorage.setItem(
+          LS_IMAGE_COL_HEIGHTS_KEY,
+          JSON.stringify(next)
+        );
+      } catch {}
+    },
+    200
+  );
 
   useEffect(() => {
     persistColWidthsDebounced(colWidthsByCategory);
@@ -255,18 +387,18 @@ export default function Viewer() {
   }, [imageColHeightsByCategory, persistImageColHeightsDebounced]);
 
   // Helpers: header orders
-  function headerOriginalOrder() {
+  function headerOriginalOrder(): string[] {
     if (schema?.headerOriginalOrder?.length) return schema.headerOriginalOrder;
     if (!items?.length) return [];
     return Object.keys(items[0]).filter((k) => k !== "category" && k !== "ID");
   }
-  function headerNormalizedOrder() {
+  function headerNormalizedOrder(): string[] {
     if (schema?.headerNormalizedOrder?.length)
       return schema.headerNormalizedOrder;
     return headerOriginalOrder().map((h) => String(h).toLowerCase());
   }
-  function getVisualColumnCount() {
-    return 1 + 1 + headerOriginalOrder().length + 1; // Sel + ID + data + Total
+  function getVisualColumnCount(): number {
+    return 1 + 1 + headerOriginalOrder().length + 1; // Sel + ID + data + Total (UI only)
   }
 
   // Ensure widths array shape
@@ -276,7 +408,7 @@ export default function Viewer() {
     setColWidthsByCategory((prev) => {
       const existing = prev[active];
       if (existing && existing.length === count) return prev;
-      const nextArr = new Array(count);
+      const nextArr = new Array<number>(count);
       let i = 0;
       nextArr[i++] = SIZING.defaults.sel;
       nextArr[i++] = SIZING.defaults.id;
@@ -292,13 +424,13 @@ export default function Viewer() {
       return { ...prev, [active]: nextArr };
     });
   }
-  function getColWidths() {
+  function getColWidths(): number[] {
     if (!active) return [];
     const arr = colWidthsByCategory[active];
     if (!arr || arr.length !== getVisualColumnCount()) return [];
     return arr;
   }
-  function setColWidthAt(index, width) {
+  function setColWidthAt(index: number, width: number) {
     if (!active) return;
     const clamped = Math.max(
       SIZING.colMin,
@@ -312,7 +444,7 @@ export default function Viewer() {
     // Also set CSS variable for immediate visual update
     setCssVar(`--col-${index}-w`, `${clamped}px`);
   }
-  function getRowHeightById(id) {
+  function getRowHeightById(id: string): number {
     if (!active || !id) return SIZING.defaults.row;
     const map = rowHeightsByCategory[active] || {};
     return Math.max(
@@ -320,7 +452,7 @@ export default function Viewer() {
       Math.min(SIZING.rowMax, Number(map[id] || SIZING.defaults.row))
     );
   }
-  function setRowHeightById(id, height) {
+  function setRowHeightById(id: string, height: number) {
     if (!active || !id) return;
     const clamped = Math.max(
       SIZING.rowMin,
@@ -334,7 +466,7 @@ export default function Viewer() {
   }
 
   // Image column height: base height from state; transform scaleY for live updates
-  function getImageColHeight(normKey) {
+  function getImageColHeight(normKey: string): number {
     if (!active || !normKey) return SIZING.defaults.imageColHeight;
     const perCat = imageColHeightsByCategory[active] || {};
     const h = perCat[normKey];
@@ -344,7 +476,7 @@ export default function Viewer() {
     );
   }
   const persistImgColHeightDebounced = useDebouncedCallback(
-    (normKey, height) => {
+    (normKey: string, height: number) => {
       if (!active || !normKey) return;
       const clamped = Math.max(
         SIZING.rowMin,
@@ -358,7 +490,7 @@ export default function Viewer() {
     },
     120
   );
-  function setImageColHeightCssVar(normKey, heightPx) {
+  function setImageColHeightCssVar(normKey: string, heightPx: number) {
     const clamped = Math.max(
       SIZING.rowMin,
       Math.min(SIZING.rowMax, Math.round(heightPx))
@@ -367,15 +499,14 @@ export default function Viewer() {
   }
 
   // Scale vars for image columns
-  const imgColScaleRef = useRef({}); // { normKey: scale }
-  function setImageColScaleCssVar(normKey, scale) {
+  const imgColScaleRef = useRef<Record<string, number>>({});
+  function setImageColScaleCssVar(normKey: string, scale: number) {
     const s = Math.max(0.1, Math.min(10, scale)); // clamp
     imgColScaleRef.current[normKey] = s;
     setCssVar(`--imgcol-${normKey}-scale`, String(s));
   }
   const commitImgColHeightDebounced = useDebouncedCallback(
-    (normKey, targetHeightPx) => {
-      // Commit base height, reset scale to 1, and persist to state/localStorage
+    (normKey: string, targetHeightPx: number) => {
       setImageColHeightCssVar(normKey, targetHeightPx);
       setImageColScaleCssVar(normKey, 1);
       persistImgColHeightDebounced(normKey, targetHeightPx);
@@ -384,13 +515,13 @@ export default function Viewer() {
   );
 
   // requestAnimationFrame scheduling for smooth CSS var updates
-  const rafIdRef = useRef(null);
-  const pendingUpdateRef = useRef({}); // { [`--var`]: value }
+  const rafIdRef = useRef<number | null>(null);
+  const pendingUpdateRef = useRef<Record<string, string>>({});
 
-  function setCssVar(name, value) {
+  function setCssVar(name: string, value: string) {
     pendingUpdateRef.current[name] = value;
     if (rafIdRef.current) return;
-    rafIdRef.current = requestAnimationFrame(() => {
+    rafIdRef.current = window.requestAnimationFrame(() => {
       const entries = Object.entries(pendingUpdateRef.current);
       entries.forEach(([n, v]) => {
         document.documentElement.style.setProperty(n, v);
@@ -401,11 +532,19 @@ export default function Viewer() {
   }
 
   // Drag state (column/row)
-  const [draggingCol, setDraggingCol] = useState(null); // { index, startX, startWidth }
-  const [draggingRow, setDraggingRow] = useState(null); // { id, startY, startHeight }
+  const [draggingCol, setDraggingCol] = useState<{
+    index: number;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
+  const [draggingRow, setDraggingRow] = useState<{
+    id: string;
+    startY: number;
+    startHeight: number;
+  } | null>(null);
 
   useEffect(() => {
-    function onMove(e) {
+    function onMove(e: MouseEvent) {
       if (draggingCol) {
         const delta = e.clientX - draggingCol.startX;
         const next = draggingCol.startWidth + delta;
@@ -444,7 +583,7 @@ export default function Viewer() {
 
   // Context menu global close
   useEffect(() => {
-    const onKey = (e) => {
+    const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setCtxMenu((p) => ({ ...p, open: false }));
     };
     const onDocClick = () => setCtxMenu((p) => ({ ...p, open: false }));
@@ -487,19 +626,19 @@ export default function Viewer() {
       const json = await res.json();
       setCategories(json.categories || []);
       if (json.categories?.length) {
-        if (!active || !json.categories.find((c) => c.name === active))
+        if (!active || !json.categories.find((c: any) => c.name === active))
           setActive(json.categories[0].name);
       } else {
         setActive(null);
       }
-    } catch (err) {
+    } catch (err: any) {
       setError(err?.message || "Failed to load categories");
     } finally {
       setLoadingCats(false);
     }
   }
 
-  async function loadCategoryItems(category) {
+  async function loadCategoryItems(category: string) {
     setLoadingItems(true);
     setItems([]);
     setSchema(null);
@@ -527,14 +666,14 @@ export default function Viewer() {
           ? prev
           : { ...(prev || {}), [category]: true }
       );
-    } catch (err) {
+    } catch (err: any) {
       setError(err?.message || "Failed to load items");
     } finally {
       setLoadingItems(false);
     }
   }
 
-  async function checkIdExists(id) {
+  async function checkIdExists(id: string) {
     if (!id || !String(id).trim()) {
       setNewRowIdExists(false);
       return false;
@@ -556,7 +695,11 @@ export default function Viewer() {
     }
   }
 
-  async function presignUpload(filename, contentType, meta) {
+  async function presignUpload(
+    filename: string,
+    contentType: string,
+    meta: Record<string, string>
+  ) {
     const res = await fetch(`${API_BASE}/uploads/presign`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -567,7 +710,11 @@ export default function Viewer() {
   }
 
   // Initialize selections
-  function initializeSelectionForCategory(category, schemaObj, itemsArr) {
+  function initializeSelectionForCategory(
+    category: string,
+    schemaObj: any,
+    itemsArr: any[]
+  ) {
     setColumnSelectionByCategory((prev) => {
       if (prev?.[category]) return prev;
       const next = { ...(prev || {}) };
@@ -576,9 +723,9 @@ export default function Viewer() {
         : itemsArr?.length
         ? Object.keys(itemsArr[0]).filter((k) => k !== "category" && k !== "ID")
         : [];
-      const normalized = orig.map((h) => String(h).toLowerCase());
-      const map = { id: true, total: true };
-      normalized.forEach((n) => (map[n] = true));
+      const normalized = orig.map((h: string) => String(h).toLowerCase());
+      const map: Record<string, boolean> = { id: true, total: true };
+      normalized.forEach((n: string) => (map[n] = true));
       next[category] = map;
       return next;
     });
@@ -586,8 +733,8 @@ export default function Viewer() {
     setRowSelectionByCategory((prev) => {
       const existing = (prev && prev[category]) || {};
       const next = { ...(prev || {}) };
-      const currentIds = new Set((itemsArr || []).map((it) => it.ID));
-      const merged = {};
+      const currentIds = new Set((itemsArr || []).map((it: any) => it.ID));
+      const merged: Record<string, boolean> = {};
       for (const id of Object.keys(existing)) {
         if (currentIds.has(id)) merged[id] = !!existing[id];
       }
@@ -600,7 +747,7 @@ export default function Viewer() {
   }
 
   // Column toggles
-  function toggleColumnForActive(normKey) {
+  function toggleColumnForActive(normKey: string) {
     if (!active) return;
     setColumnSelectionByCategory((prev) => {
       const prevMap = (prev && prev[active]) || {};
@@ -611,7 +758,7 @@ export default function Viewer() {
   }
 
   // Row selection helpers
-  function toggleRowSelection(id) {
+  function toggleRowSelection(id: string) {
     if (!active) return;
     setRowSelectionByCategory((prev) => {
       const prevMap = (prev && prev[active]) || {};
@@ -620,24 +767,24 @@ export default function Viewer() {
       return next;
     });
   }
-  function setAllRowsSelectedForActive(selectAll) {
+  function setAllRowsSelectedForActive(selectAll: boolean) {
     if (!active) return;
     setRowSelectionByCategory((prev) => {
       const next = { ...(prev || {}) };
-      const map = {};
+      const map: Record<string, boolean> = {};
       for (const it of items || []) map[it.ID] = !!selectAll;
       next[active] = map;
       return next;
     });
   }
-  function areAllRowsSelected() {
+  function areAllRowsSelected(): boolean {
     if (!active) return false;
     const map =
       (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
     if (!items?.length) return false;
     return items.every((it) => !!map[it.ID]);
   }
-  function anyRowSelected() {
+  function anyRowSelected(): boolean {
     if (!active) return false;
     const map =
       (rowSelectionByCategory && rowSelectionByCategory[active]) || {};
@@ -658,7 +805,7 @@ export default function Viewer() {
       return;
     }
     const firstId = items[0] ? items[0].ID : null;
-    if (ids.includes(firstId)) {
+    if (firstId && ids.includes(firstId)) {
       setModalError({
         title: "Cannot delete first row",
         message: "The first data row is protected and cannot be deleted.",
@@ -668,6 +815,44 @@ export default function Viewer() {
     setPendingDeleteRowIds(ids);
     setConfirmDeleteRowsOpen(true);
   }
+  async function deleteCategoryConfirmed() {
+    if (!deletingCategory) return;
+    try {
+      // Optional: confirmation guard. Remove if you prefer no prompt
+      const ok = window.confirm(
+        `Delete category "${deletingCategory}"? This will remove all items in that category.`
+      );
+      if (!ok) {
+        setDeletingCategory(false);
+        return;
+      }
+
+      const res = await fetch(
+        `${API_BASE}/category/${encodeURIComponent(deletingCategory)}`,
+        { method: "DELETE" }
+      );
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(txt || `Server responded ${res.status}`);
+      }
+
+      // If the deleted category was active, clear active selection
+      setActive((prev) => (prev === deletingCategory ? null : prev));
+
+      // Refresh categories to reflect deletion
+      await loadCategories();
+
+      // Close modal/state
+      setDeletingCategory(false);
+    } catch (err: any) {
+      setModalError({
+        title: "Delete category failed",
+        message: err?.message || "Unable to delete category.",
+      });
+      setDeletingCategory(false);
+    }
+  }
+
   async function confirmDeleteSelectedRows() {
     if (!active || !pendingDeleteRowIds.length) {
       setPendingDeleteRowIds([]);
@@ -683,7 +868,7 @@ export default function Viewer() {
           })
         )
       );
-      const failed = [];
+      const failed: Array<{ id: string; text: string; status: number }> = [];
       for (let i = 0; i < responses.length; i++) {
         if (!responses[i].ok) {
           const txt = await responses[i].text().catch(() => "");
@@ -699,10 +884,10 @@ export default function Viewer() {
           title: "Delete incomplete",
           message: `Failed to delete ${failed.length} rows. See console.`,
         });
-      await loadCategoryItems(active);
+      await loadCategoryItems(active!);
       setPendingDeleteRowIds([]);
       setConfirmDeleteRowsOpen(false);
-    } catch (err) {
+    } catch (err: any) {
       setModalError({
         title: "Delete failed",
         message: err?.message || "Unable to delete rows.",
@@ -713,8 +898,10 @@ export default function Viewer() {
   }
 
   // Column delete
-  function isProtectedColumn(orig) {
-    const n = String(orig || "").trim().toLowerCase();
+  function isProtectedColumn(orig: string) {
+    const n = String(orig || "")
+      .trim()
+      .toLowerCase();
     return false;
   }
   async function confirmDeleteColumn() {
@@ -735,13 +922,13 @@ export default function Viewer() {
     try {
       let res = await fetch(
         `${API_BASE}/category/${encodeURIComponent(
-          active
+          active!
         )}/column/${encodeURIComponent(col)}`,
         { method: "DELETE" }
       );
       if (!res.ok) {
         res = await fetch(
-          `${API_BASE}/category/${encodeURIComponent(active)}/column`,
+          `${API_BASE}/category/${encodeURIComponent(active!)}/column`,
           {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
@@ -750,9 +937,9 @@ export default function Viewer() {
         );
       }
       if (!res.ok) throw new Error(await res.text());
-      await loadCategoryItems(active);
+      await loadCategoryItems(active!);
       setPendingDeleteColumn(null);
-    } catch (err) {
+    } catch (err: any) {
       setModalError({
         title: "Delete column failed",
         message: err?.message || "Unable to delete column.",
@@ -763,7 +950,7 @@ export default function Viewer() {
   }
 
   // Insert column
-  function openInsertColumnAt(index) {
+  function openInsertColumnAt(index: number) {
     setInsertColumnIndex(index);
     setNewColumnName("");
     setInsertColumnOpen(true);
@@ -781,7 +968,7 @@ export default function Viewer() {
     setInsertingColumn(true);
     try {
       const res = await fetch(
-        `${API_BASE}/category/${encodeURIComponent(active)}/column`,
+        `${API_BASE}/category/${encodeURIComponent(active!)}/column`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -793,16 +980,17 @@ export default function Viewer() {
         }
       );
       if (!res.ok) throw new Error(await res.text());
-      const nName = norm(name);
-      setSchema((prev) => {
+      const nName = norm(name) as string;
+      setSchema((prev: any) => {
         const orig = prev?.headerOriginalOrder
           ? prev.headerOriginalOrder.slice()
           : headerOriginalOrder().slice();
         const normArr = prev?.headerNormalizedOrder
           ? prev.headerNormalizedOrder.slice()
           : headerNormalizedOrder().slice();
-        orig.splice(insertColumnIndex, 0, name);
-        normArr.splice(insertColumnIndex, 0, nName);
+        const idx = insertColumnIndex;
+        orig.splice(idx, 0, name);
+        normArr.splice(idx, 0, nName);
         return {
           ...(prev || {}),
           headerOriginalOrder: orig,
@@ -812,12 +1000,12 @@ export default function Viewer() {
       });
       setItems((prev) => prev.map((it) => ({ ...it, [nName]: null })));
       setColumnSelectionByCategory((prev) => {
-        const map = (prev && prev[active]) || {};
-        return { ...prev, [active]: { ...map, [nName]: true } };
+        const map = (prev && prev[active as string]) || {};
+        return { ...prev, [active as string]: { ...map, [nName]: true } };
       });
       setInsertColumnOpen(false);
       setTimeout(() => ensureColWidthsForActive(), 0);
-    } catch (err) {
+    } catch (err: any) {
       setModalError({
         title: "Add column failed",
         message: err?.message || "Unable to add column.",
@@ -828,9 +1016,18 @@ export default function Viewer() {
   }
 
   // Context menus
-  function onHeaderCellContextMenu(e, idx, label) {
+  function onHeaderCellContextMenu(
+    e: React.MouseEvent,
+    idx: number,
+    label: string
+  ) {
     e.preventDefault();
-    if (String(label || "").trim().toLowerCase() === "id") return;
+    if (
+      String(label || "")
+        .trim()
+        .toLowerCase() === "id"
+    )
+      return;
     setCtxMenu({
       open: true,
       x: e.clientX + 2,
@@ -849,7 +1046,6 @@ export default function Viewer() {
     const idx = ctxMenu.columnIndex ?? 0;
     const colName = String(ctxMenu.columnName || "");
     if (colName.trim().toLowerCase() === "id") return null;
-
     return (
       <div
         className="fixed z-50 bg-white border border-gray-300 rounded shadow-lg"
@@ -879,7 +1075,12 @@ export default function Viewer() {
     );
   }
 
-  function onBodyCellContextMenu(e, rowIdx, rowId, cellNormKey) {
+  function onBodyCellContextMenu(
+    e: React.MouseEvent,
+    rowIdx: number,
+    rowId: string,
+    cellNormKey: string
+  ) {
     e.preventDefault();
     setCtxMenu({
       open: true,
@@ -895,10 +1096,10 @@ export default function Viewer() {
     });
   }
 
-  function openInsertRowAt(index) {
+  function openInsertRowAt(index: number) {
     setInsertRowIndex(index);
     const headerNorm = headerNormalizedOrder();
-    const initValues = {};
+    const initValues: Record<string, string> = {};
     for (const nk of headerNorm) {
       if (nk === "total" || nk === "id" || nk === "category") continue;
       initValues[nk] = "";
@@ -931,7 +1132,7 @@ export default function Viewer() {
     setInsertingRow(true);
     try {
       const headerNorm = headerNormalizedOrder();
-      const values = {};
+      const values: Record<string, string | null> = {};
       for (const nk of headerNorm) {
         if (nk === "total" || nk === "id" || nk === "category") continue;
         const v = newRowValues[nk];
@@ -939,7 +1140,7 @@ export default function Viewer() {
       }
 
       const res = await fetch(
-        `${API_BASE}/category/${encodeURIComponent(active)}/row`,
+        `${API_BASE}/category/${encodeURIComponent(active!)}/row`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -953,7 +1154,7 @@ export default function Viewer() {
       const json = await res.json();
       const created = json.item || null;
       if (!created) {
-        await loadCategoryItems(active);
+        await loadCategoryItems(active!);
         setInsertRowOpen(false);
         return;
       }
@@ -964,11 +1165,11 @@ export default function Viewer() {
         return next;
       });
       setRowSelectionByCategory((prev) => {
-        const map = (prev && prev[active]) || {};
-        return { ...prev, [active]: { ...map, [created.ID]: true } };
+        const map = (prev && prev[active as string]) || {};
+        return { ...prev, [active as string]: { ...map, [created.ID]: true } };
       });
       setInsertRowOpen(false);
-    } catch (err) {
+    } catch (err: any) {
       setModalError({
         title: "Add row failed",
         message: err?.message || "Unable to add row.",
@@ -978,7 +1179,7 @@ export default function Viewer() {
     }
   }
 
-  async function deleteRowById(id) {
+  async function deleteRowById(id: string) {
     if (!id) return;
     const firstId = items[0] ? items[0].ID : null;
     if (id === firstId) {
@@ -999,12 +1200,12 @@ export default function Viewer() {
       }
       setItems((prev) => prev.filter((it) => it.ID !== id));
       setRowSelectionByCategory((prev) => {
-        const map = (prev && prev[active]) || {};
+        const map = (prev && prev[active as string]) || {};
         const nextMap = { ...map };
         delete nextMap[id];
-        return { ...prev, [active]: nextMap };
+        return { ...prev, [active as string]: nextMap };
       });
-    } catch (err) {
+    } catch (err: any) {
       setModalError({
         title: "Delete failed",
         message: err?.message || "Unable to delete row.",
@@ -1015,13 +1216,11 @@ export default function Viewer() {
     }
   }
 
-  // Image columns autodetect
-
   function RowContextMenu() {
     if (!ctxMenu.open || ctxMenu.type !== "row" || ctxMenu.isHeaderCell)
       return null;
     const idx = ctxMenu.rowIndex ?? 0;
-    const rowId = ctxMenu.rowId;
+    const rowId = ctxMenu.rowId!;
     const cellNormKey = ctxMenu.cellNormKey || null;
     return (
       <div
@@ -1063,7 +1262,7 @@ export default function Viewer() {
           className="w-full text-left px-3 py-2 hover:bg-gray-100 flex items-center gap-2"
           onClick={() => {
             setCtxMenu((p) => ({ ...p, open: false }));
-            setInsertImageTarget({ id: rowId, normKey: cellNormKey });
+            setInsertImageTarget({ id: rowId, normKey: cellNormKey! });
             setImageUploadMode("upload");
             setImageFile(null);
             setImageUrl("");
@@ -1080,23 +1279,8 @@ export default function Viewer() {
     );
   }
 
-  const imageColumns = useMemo(() => {
-    const norm = headerNormalizedOrder();
-    const set = new Set();
-    for (const nk of norm) {
-      for (const it of items || []) {
-        const img = parseImageValue(it[nk]);
-        if (img) {
-          set.add(nk);
-          break;
-        }
-      }
-    }
-    return set;
-  }, [items]);
-
   // Export helpers
-  function computeTotalForItem(item, headerNorms) {
+  function computeTotalForItem(item: any, headerNorms: string[]) {
     const excluded = new Set([
       "id",
       "nombre",
@@ -1118,8 +1302,8 @@ export default function Viewer() {
     }
     return sum;
   }
-  function computeColumnTotalsForItems(itemsArr, headerNorms) {
-    const totals = {};
+  function computeColumnTotalsForItems(itemsArr: any[], headerNorms: string[]) {
+    const totals: Record<string, number | null> = {};
     const excluded = new Set([
       "id",
       "nom",
@@ -1149,63 +1333,256 @@ export default function Viewer() {
     }
     return totals;
   }
-  function getSelectionForCategory(category, headerNorms) {
+  function getSelectionForCategory(
+    category: string,
+    headerNorms: string[]
+  ): Record<string, boolean> {
     const saved = columnSelectionByCategory[category];
     if (saved) return saved;
-    const map = {};
+    const map: Record<string, boolean> = {};
     map["id"] = true;
     headerNorms.forEach((n) => (map[n] = true));
     map["total"] = true;
     return map;
   }
-  function buildRowsForExport(
+
+  // Client-side ExcelJS helpers
+  function excelColWidthFromPx(px: number) {
+    return Math.max(6, Math.round(px / 10));
+  }
+  function detectImageExtensionFromUrlOrCT(
+    url: string,
+    contentType: string | null
+  ) {
+    const u = (url || "").toLowerCase();
+    if (contentType?.includes("png") || u.endsWith(".png")) return "png";
+    if (contentType?.includes("webp") || u.endsWith(".webp")) return "webp";
+    return "jpeg";
+  }
+
+  async function presignGetIfNeeded(
+    imgObj: ImageCell
+  ): Promise<{ url: string; contentType: string | null }> {
+    if (imgObj?.s3Key) {
+      try {
+        const res = await fetch(
+          `${API_BASE}/uploads/presign-get?s3Key=${encodeURIComponent(
+            imgObj.s3Key
+          )}`
+        );
+        if (!res.ok) return { url: imgObj.src || "", contentType: null };
+        const json = await res.json();
+        return { url: json.url || imgObj.src || "", contentType: null };
+      } catch {
+        return { url: imgObj.src || "", contentType: null };
+      }
+    }
+    return { url: imgObj?.src || "", contentType: null };
+  }
+
+  async function fetchImageArrayBufferWithCT(
+    url: string
+  ): Promise<{ ab: ArrayBuffer | null; contentType: string | null }> {
+    try {
+      const res = await fetch(url, { mode: "cors" });
+      if (!res.ok) throw new Error(`Image fetch failed: ${res.status}`);
+      const ct = res.headers.get("content-type") || null;
+      const ab = await res.arrayBuffer();
+      return { ab, contentType: ct };
+    } catch (e) {
+      console.warn("fetchImageArrayBufferWithCT error for", url, e);
+      return { ab: null, contentType: null };
+    }
+  }
+
+  async function addSheetWithImages({
+    workbook,
+    sheetName,
     itemsArr,
     headerOrig,
     headerNorm,
     selection,
     rowSelectionMap,
     exportSelectedOnly,
-    includeTotalsRow
-  ) {
-    let filteredItems = itemsArr;
-    if (exportSelectedOnly && rowSelectionMap)
-      filteredItems = itemsArr.filter((it) => !!rowSelectionMap[it.ID]);
+    includeTotalsRow,
+    colWidthsPx, // UI widths
+  }: {
+    workbook: ExcelJS.Workbook;
+    sheetName: string;
+    itemsArr: any[];
+    headerOrig: string[];
+    headerNorm: string[];
+    selection: Record<string, boolean>;
+    rowSelectionMap: Record<string, boolean> | null;
+    exportSelectedOnly: boolean;
+    includeTotalsRow: boolean;
+    colWidthsPx: number[];
+  }) {
+    const worksheet = workbook.addWorksheet(sheetName.substring(0, 31));
 
-    const rows = [];
-    const headers = [];
+    // Build headers for Excel: DO NOT include "Sel"
+    const headers: string[] = [];
     if (selection["id"]) headers.push("ID");
     for (let i = 0; i < headerOrig.length; i++) {
-      const orig = headerOrig[i];
-      const normKey = headerNorm[i];
-      if (selection[normKey]) headers.push(orig);
+      if (selection[headerNorm[i]]) headers.push(headerOrig[i]);
     }
     if (selection["total"]) headers.push("Total");
-    rows.push(headers);
+    worksheet.addRow(headers);
 
-    for (const it of filteredItems) {
-      const r = [];
-      if (selection["id"]) r.push(it.ID);
-      for (let i = 0; i < headerOrig.length; i++) {
-        const normKey = headerNorm[i];
-        if (selection[normKey])
-          r.push(
-            it[normKey] === undefined || it[normKey] === null ? "" : it[normKey]
-          );
+    // Column widths from UI widths (skip "Sel")
+    const columns: ExcelJS.Column[] = [];
+    // ID width (UI index 1)
+    if (selection["id"]) {
+      columns.push({
+        width: excelColWidthFromPx(colWidthsPx?.[1] || SIZING.defaults.id),
+      });
+    }
+    // Data columns (UI index 2..)
+    for (let i = 0; i < headerOrig.length; i++) {
+      if (selection[headerNorm[i]]) {
+        const vIdx = 2 + i; // UI visual index for this column
+        columns.push({
+          width: excelColWidthFromPx(
+            colWidthsPx?.[vIdx] || SIZING.defaults.data
+          ),
+        });
       }
-      if (selection["total"]) r.push(computeTotalForItem(it, headerNorm));
-      rows.push(r);
+    }
+    // Total column (UI index 2 + headerOrig.length)
+    if (selection["total"]) {
+      const vIdx = 2 + headerOrig.length;
+      columns.push({
+        width: excelColWidthFromPx(
+          colWidthsPx?.[vIdx] || SIZING.defaults.total
+        ),
+      });
+    }
+    worksheet.columns = columns;
+
+    // Filtered items according to row selection
+    let filteredItems = itemsArr;
+    if (exportSelectedOnly && rowSelectionMap) {
+      filteredItems = itemsArr.filter((it) => !!rowSelectionMap[it.ID]);
     }
 
+    // Add rows and collect image cells for embedding
+    for (const it of filteredItems) {
+      const rowVals: Array<number | string | null> = [];
+
+      // ID first (as text)
+      if (selection["id"]) {
+        rowVals.push(String(it.ID));
+      }
+
+      const imageCells: Array<{ colIndexInExcel: number; imgObj: ImageCell }> =
+        [];
+
+      for (let i = 0; i < headerOrig.length; i++) {
+        const nk = headerNorm[i];
+        if (!selection[nk]) continue;
+
+        const rawVal = it[nk];
+        const imgObj = parseImageValue(rawVal);
+        if (imgObj?.src) {
+          // Leave cell empty; image overlays
+          rowVals.push("");
+          imageCells.push({ colIndexInExcel: rowVals.length, imgObj });
+        } else {
+          // Coerce numeric where applicable
+          const coerced = toNumberIfNumeric(rawVal);
+          rowVals.push(coerced === undefined ? "" : coerced);
+        }
+      }
+
+      if (selection["total"]) {
+        rowVals.push(computeTotalForItem(it, headerNorm)); // numeric
+      }
+
+      const newRow = worksheet.addRow(rowVals);
+      newRow.height = Math.max(20, Math.round(getRowHeightById(it.ID) / 1.6));
+
+      // Track tallest image for row to bump row height afterwards
+      let maxImageHeightForRowPx = 0;
+
+      // Embed images (relative to current row) with min width, aspect ratio, and auto column widening
+      for (const cell of imageCells) {
+        const { imgObj } = cell;
+        const { url } = await presignGetIfNeeded(imgObj);
+        const { ab, contentType } = await fetchImageArrayBufferWithCT(url);
+        if (!ab) continue;
+
+        // Read intrinsic dimensions to preserve aspect ratio
+        const dims = await getImageDimensionsFromBuffer(ab);
+        // If we don't get dimensions, assume square
+        const intrinsicW = dims?.width ?? 1;
+        const intrinsicH = dims?.height ?? 1;
+        const aspectRatio = intrinsicH / intrinsicW;
+
+        const ext = detectImageExtensionFromUrlOrCT(imgObj.src, contentType);
+        const imageId = workbook.addImage({
+          buffer: ab,
+          extension: ext as any,
+        });
+
+        // Column index counting from Excel headers (no "Sel" in Excel)
+        const colIdx1Based = cell.colIndexInExcel;
+        const rowIdx1Based = newRow.number;
+
+        // Current column width (characters and px)
+        const excelCol = worksheet.columns[colIdx1Based - 1];
+        const currentChars = excelCol?.width || 10;
+        const currentPxWidth = charsToPx(currentChars);
+
+        // Enforce minimum image width: 2 inches = 192 px
+        const targetPxWidth = Math.max(MIN_IMAGE_WIDTH_PX, currentPxWidth);
+
+        // Compute height strictly by aspect ratio; do NOT cap by row height
+        const finalHeightPx = Math.max(
+          24,
+          Math.round(targetPxWidth * aspectRatio)
+        );
+
+        // Widen column if needed to fit target width
+        if (currentPxWidth < targetPxWidth) {
+          worksheet.columns[colIdx1Based - 1].width = pxToChars(targetPxWidth);
+        }
+
+        // Add the image anchored to the single cell
+        worksheet.addImage(imageId, {
+          tl: { col: colIdx1Based - 1, row: rowIdx1Based - 1 },
+          ext: {
+            width: Math.max(24, targetPxWidth),
+            height: finalHeightPx,
+          },
+          editAs: "oneCell",
+        });
+
+        // Track tallest image to adjust row height later so it doesn't clip
+        maxImageHeightForRowPx = Math.max(
+          maxImageHeightForRowPx,
+          finalHeightPx
+        );
+      }
+
+      // Bump row height to fit tallest image in this row
+      if (maxImageHeightForRowPx > 0) {
+        // ExcelJS row height uses points; ~1 px ≈ 0.75 points
+        const pointsPerPx = 0.75;
+        const neededPoints = Math.round(maxImageHeightForRowPx * pointsPerPx);
+        newRow.height = Math.max(newRow.height || 20, neededPoints);
+      }
+    }
+
+    // Totals row
     if (includeTotalsRow) {
       const colTotals = computeColumnTotalsForItems(filteredItems, headerNorm);
-      const totalsRow = [];
-      if (selection["id"]) totalsRow.push("Totals");
+      const totalsRow: Array<number | string> = [];
+      if (selection["id"]) totalsRow.push(""); // leave ID totals blank
       for (let i = 0; i < headerOrig.length; i++) {
-        const normKey = headerNorm[i];
-        if (selection[normKey]) {
-          const val = colTotals[normKey];
-          totalsRow.push(val == null ? "" : val);
-        }
+        const nk = headerNorm[i];
+        if (!selection[nk]) continue;
+        const v = colTotals[nk];
+        totalsRow.push(v == null ? "" : v);
       }
       if (selection["total"]) {
         const totOfTotals = filteredItems.reduce(
@@ -1214,12 +1591,20 @@ export default function Viewer() {
         );
         totalsRow.push(totOfTotals);
       }
-      rows.push(totalsRow);
+      const row = worksheet.addRow(totalsRow);
+      row.font = { bold: true };
+      row.height = Math.max(18, Math.round(SIZING.defaults.row / 1.8));
     }
 
-    return rows;
+    // Style header row
+    const headerRow = worksheet.getRow(1);
+    headerRow.font = { bold: true };
+    headerRow.alignment = { vertical: "middle" };
+    headerRow.height = Math.max(18, Math.round(SIZING.defaults.row / 1.8));
   }
-  async function exportCategoryWithSelection(category) {
+
+  // Client-side ExcelJS export (Category)
+  async function exportCategoryWithSelection(category: string) {
     setExportingCategory(true);
     try {
       let useItems = items;
@@ -1238,41 +1623,39 @@ export default function Viewer() {
         : useItems.length
         ? Object.keys(useItems[0]).filter((k) => k !== "category" && k !== "ID")
         : [];
-      const headerNorm = headerOrig.map((h) => String(h).toLowerCase());
+      const headerNorm = headerOrig.map((h: string) => String(h).toLowerCase());
       const selection = getSelectionForCategory(category, headerNorm);
       const rowSelectionMap =
         (rowSelectionByCategory && rowSelectionByCategory[category]) || null;
       const exportSelectedOnly = !!exportSelectedRowsOnlyByCategory[category];
       const includeTotalsRow = !!includeTotalsRowByCategory[category];
 
-      const rows = buildRowsForExport(
-        useItems,
+      const wb = new ExcelJS.Workbook();
+      wb.creator = "Inventory Viewer";
+      wb.created = new Date();
+
+      await addSheetWithImages({
+        workbook: wb,
+        sheetName: category || "category",
+        itemsArr: useItems,
         headerOrig,
         headerNorm,
         selection,
         rowSelectionMap,
         exportSelectedOnly,
-        includeTotalsRow
+        includeTotalsRow,
+        colWidthsPx: getColWidths(),
+      });
+
+      const buffer = await wb.xlsx.writeBuffer();
+      saveAs(
+        new Blob([buffer], {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }),
+        `${category}.xlsx`
       );
-      const ws = XLSX.utils.aoa_to_sheet(rows);
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(
-        wb,
-        ws,
-        (category || "category").substring(0, 31)
-      );
-      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-      const blob = new Blob([wbout], { type: "application/octet-stream" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${category}.xlsx`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error("exportCategoryWithSelection", err);
+    } catch (err: any) {
+      console.error("exportCategoryWithSelection(exceljs)", err);
       setModalError({
         title: "Export failed",
         message: err?.message || "Unable to export category.",
@@ -1281,10 +1664,15 @@ export default function Viewer() {
       setExportingCategory(false);
     }
   }
+
+  // Client-side ExcelJS export (All)
   async function exportAllWithSelections() {
     setExportingAll(true);
     try {
-      const wb = XLSX.utils.book_new();
+      const wb = new ExcelJS.Workbook();
+      wb.creator = "Inventory Viewer";
+      wb.created = new Date();
+
       const catNames = categories.map((c) => c.name);
       for (const catName of catNames) {
         const res = await fetch(
@@ -1297,6 +1685,7 @@ export default function Viewer() {
         const json = await res.json();
         const useItems = json.items || [];
         const useSchema = json.schema || null;
+
         const headerOrig = useSchema?.headerOriginalOrder?.length
           ? useSchema.headerOriginalOrder
           : useItems.length
@@ -1304,7 +1693,9 @@ export default function Viewer() {
               (k) => k !== "category" && k !== "ID"
             )
           : [];
-        const headerNorm = headerOrig.map((h) => String(h).toLowerCase());
+        const headerNorm = headerOrig.map((h: string) =>
+          String(h).toLowerCase()
+        );
         const selection = getSelectionForCategory(catName, headerNorm);
 
         const rowSelectionMap =
@@ -1312,34 +1703,29 @@ export default function Viewer() {
         const exportSelectedOnly = !!exportSelectedRowsOnlyByCategory[catName];
         const includeTotalsRow = !!includeTotalsRowByCategory[catName];
 
-        const rows = buildRowsForExport(
-          useItems,
+        await addSheetWithImages({
+          workbook: wb,
+          sheetName: catName || "category",
+          itemsArr: useItems,
           headerOrig,
           headerNorm,
           selection,
           rowSelectionMap,
           exportSelectedOnly,
-          includeTotalsRow
-        );
-        const ws = XLSX.utils.aoa_to_sheet(rows);
-        XLSX.utils.book_append_sheet(
-          wb,
-          ws,
-          (catName || "category").substring(0, 31)
-        );
+          includeTotalsRow,
+          colWidthsPx: getColWidths(), // you can persist per-category if desired
+        });
       }
-      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-      const blob = new Blob([wbout], { type: "application/octet-stream" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `all_categories.xlsx`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error("exportAllWithSelections", err);
+
+      const buffer = await wb.xlsx.writeBuffer();
+      saveAs(
+        new Blob([buffer], {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }),
+        `inventory.xlsx`
+      );
+    } catch (err: any) {
+      console.error("exportAllWithSelections(exceljs)", err);
       setModalError({
         title: "Export failed",
         message: err?.message || "Unable to export all categories.",
@@ -1349,8 +1735,152 @@ export default function Viewer() {
     }
   }
 
-  // Header checkbox row
-  function headerCheckboxRow(selection) {
+  // Editing save helper
+  async function saveEdit(id: string, normKey: string, newValue: string) {
+    const original = editingCell
+      ? editingCell.original == null
+        ? ""
+        : String(editingCell.original)
+      : "";
+    const incoming = newValue == null ? "" : String(newValue);
+    if (incoming === original) {
+      cancelEdit();
+      return;
+    }
+    const savingKeyLocal = `${id}|${normKey}`;
+    setSavingCellKey(savingKeyLocal);
+    try {
+      const body = { attribute: normKey, value: incoming, category: active };
+      const res = await fetch(`${API_BASE}/item/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const json = await res.json();
+      setItems((prev) =>
+        prev.map((it) =>
+          it.ID === id
+            ? { ...it, [normKey]: incoming, ...(json.updated || {}) }
+            : it
+        )
+      );
+      cancelEdit();
+    } catch (err: any) {
+      setModalError({
+        title: "Save failed",
+        message: err?.message || "Unable to save change.",
+      });
+    } finally {
+      setSavingCellKey(null);
+    }
+  }
+  function startEdit(id: string, normKey: string, initial: any) {
+    setEditingCell({
+      id,
+      normKey,
+      original: initial == null ? "" : String(initial),
+    });
+    setCellValue(initial == null ? "" : String(initial));
+  }
+  function cancelEdit() {
+    setEditingCell(null);
+    setCellValue("");
+  }
+  function onInputKeyDown(e: React.KeyboardEvent, id: string, normKey: string) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      saveEdit(id, normKey, cellValue);
+    } else if (e.key === "Escape") cancelEdit();
+  }
+
+  // Header controls
+  function headerControls() {
+    return (
+      <div className="flex gap-2 items-center">
+        <button
+          onClick={exportAllWithSelections}
+          className={`px-3 py-1 bg-indigo-600 text-white rounded flex items-center gap-2 ${
+            exportingAll ? "opacity-70 cursor-wait" : "hover:bg-indigo-700"
+          }`}
+          disabled={
+            exportingAll ||
+            exportingCategory ||
+            deletingColumn ||
+            deletingRows ||
+            replacing
+          }
+        >
+          {exportingAll ? <Spinner className="h-4 w-4 text-white" /> : null}
+          <span>{exportingAll ? "Preparing…" : "Download All"}</span>
+        </button>
+
+        <button
+          onClick={() => active && exportCategoryWithSelection(active)}
+          disabled={
+            !active ||
+            exportingCategory ||
+            exportingAll ||
+            deletingColumn ||
+            deletingRows ||
+            replacing
+          }
+          className={`px-3 py-1 bg-green-600 text-white rounded flex items-center gap-2 ${
+            !active || exportingCategory
+              ? "opacity-70 cursor-not-allowed"
+              : "hover:bg-green-700"
+          }`}
+        >
+          {exportingCategory ? (
+            <Spinner className="h-4 w-4 text-white" />
+          ) : null}
+          <span>{exportingCategory ? "Preparing…" : "Download Category"}</span>
+        </button>
+
+        <button
+          onClick={onReplaceAllClick}
+          disabled={!active || replacing || deletingColumn || deletingRows}
+          className={`px-3 py-1 bg-red-600 text-white rounded ${
+            !active || replacing
+              ? "opacity-70 cursor-not-allowed"
+              : "hover:bg-red-700"
+          }`}
+        >
+          {replacing ? <Spinner className="h-4 w-4 text-white" /> : null}
+          <span>{replacing ? "Replacing…" : "Replace Category"}</span>
+        </button>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".xlsx,.xls"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0] ?? null;
+            if (!f) return;
+            setPendingReplaceFile(f);
+            setConfirmReplaceOpen(true);
+            e.target.value = "";
+          }}
+        />
+      </div>
+    );
+  }
+  function onReplaceAllClick() {
+    if (!active) {
+      setModalError({
+        title: "No category selected",
+        message: "Select a category before replacing.",
+      });
+      return;
+    }
+    fileInputRef.current?.click();
+  }
+
+  // Header checkbox row (UI only; Sel is for UI, not in Excel)
+  function headerCheckboxRow(selection: Record<string, boolean>) {
+    const orig = headerOriginalOrder();
+    const normArr = headerNormalizedOrder();
     return (
       <tr>
         <th className="p-1 border-b text-center">
@@ -1369,9 +1899,9 @@ export default function Viewer() {
             className="cursor-pointer"
           />
         </th>
-        {headerOriginalOrder().map((h, i) => {
+        {orig.map((h, i) => {
           const protectedCol = isProtectedColumn(h);
-          const nk = headerNormalizedOrder()[i];
+          const nk = normArr[i];
           return (
             <th
               key={`chk-${i}`}
@@ -1389,10 +1919,7 @@ export default function Viewer() {
                   onClick={(e) => {
                     e.stopPropagation();
                     if (!protectedCol)
-                      setPendingDeleteColumn({
-                        columnOrig: h,
-                        columnNorm: nk,
-                      });
+                      setPendingDeleteColumn({ columnOrig: h, columnNorm: nk });
                   }}
                   title={
                     protectedCol
@@ -1411,9 +1938,25 @@ export default function Viewer() {
                   pendingDeleteColumn &&
                   pendingDeleteColumn.columnOrig === h ? (
                     <span className="inline-block">
-                      <svg className="animate-spin h-4 w-4 text-red-600" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" strokeWidth="3" />
-                        <path className="opacity-75" d="M4 12a8 8 0 018-8" strokeWidth="3" strokeLinecap="round" />
+                      <svg
+                        className="animate-spin h-4 w-4 text-red-600"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                      >
+                        <circle
+                          className="opacity-25"
+                          cx="12"
+                          cy="12"
+                          r="10"
+                          strokeWidth="3"
+                        />
+                        <path
+                          className="opacity-75"
+                          d="M4 12a8 8 0 018-8"
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                        />
                       </svg>
                     </span>
                   ) : (
@@ -1436,25 +1979,25 @@ export default function Viewer() {
     );
   }
 
-  // Render table
+  // Render table (UI includes Sel column for selection). Make it fill width.
   function renderTable() {
     if (!items?.length)
       return <div className="text-sm text-gray-500">No items found</div>;
     const orig = headerOriginalOrder();
     const normArr = headerNormalizedOrder();
-    const selection = getSelectionForCategory(active, normArr);
+    const selection = getSelectionForCategory(active as string, normArr);
     const totals = computeColumnTotalsForItems(items, normArr);
     const colWidths = getColWidths();
     const visualColCount = getVisualColumnCount();
 
     return (
-      <div className="overflow-auto border border-gray-200 rounded shadow-sm relative">
-        <table className="min-w-full table-fixed text-sm">
+      <div className="overflow-auto border border-gray-200 rounded shadow-sm relative w-full">
+        <table className="min-w-full table-fixed text-sm w-full">
           <colgroup>
             {Array.from({ length: visualColCount }).map((_, i) => (
               <col
                 key={`col-${i}`}
-                style={{ width: `var(--col-${i}-w, ${(colWidths[i] || 100)}px)` }}
+                style={{ width: `var(--col-${i}-w, ${colWidths[i] || 100}px)` }}
               />
             ))}
           </colgroup>
@@ -1479,7 +2022,11 @@ export default function Viewer() {
                     e.preventDefault();
                     const idx = 1;
                     const startW = colWidths[idx] || SIZING.defaults.id;
-                    setDraggingCol({ index: idx, startX: e.clientX, startWidth: startW });
+                    setDraggingCol({
+                      index: idx,
+                      startX: e.clientX,
+                      startWidth: startW,
+                    });
                   }}
                   style={{
                     position: "absolute",
@@ -1511,28 +2058,43 @@ export default function Viewer() {
                       <span>{h}</span>
                       {isImgCol ? (
                         <div className="flex items-center gap-1">
-                          {/* Combined width/height controls; height animated via scaleY */}
                           <button
                             className="px-1 py-0.5 rounded bg-gray-200 hover:bg-gray-300"
                             title="Decrease image/cell size"
                             onClick={(e) => {
                               e.stopPropagation();
                               const nextW = colWidth - STEP.width;
-                              setCssVar(`--col-${vIdx}-w`, `${Math.max(SIZING.colMin, nextW)}px`);
+                              setCssVar(
+                                `--col-${vIdx}-w`,
+                                `${Math.max(SIZING.colMin, nextW)}px`
+                              );
 
-                              const baseHStr = getComputedStyle(document.documentElement)
-                                .getPropertyValue(`--imgcol-${normKey}-h`).trim();
-                              const baseH = parseInt(baseHStr || `${imgColBaseH}`, 10);
-                              const currentScaleStr = getComputedStyle(document.documentElement)
-                                .getPropertyValue(`--imgcol-${normKey}-scale`).trim();
-                              const currentScale = parseFloat(currentScaleStr || "1") || 1;
+                              const baseHStr = getComputedStyle(
+                                document.documentElement
+                              )
+                                .getPropertyValue(`--imgcol-${normKey}-h`)
+                                .trim();
+                              const baseH = parseInt(
+                                baseHStr || `${imgColBaseH}`,
+                                10
+                              );
+                              const currentScaleStr = getComputedStyle(
+                                document.documentElement
+                              )
+                                .getPropertyValue(`--imgcol-${normKey}-scale`)
+                                .trim();
+                              const currentScale =
+                                parseFloat(currentScaleStr || "1") || 1;
                               const currentH = baseH * currentScale;
-                              const targetH = Math.max(SIZING.rowMin, currentH - STEP.height);
+                              const targetH = Math.max(
+                                SIZING.rowMin,
+                                currentH - STEP.height
+                              );
                               const nextScale = targetH / baseH;
 
-                              setImageColScaleCssVar(normKey, nextScale);       // immediate smooth visual
-                              commitImgColHeightDebounced(normKey, targetH);     // commit base height later
-                              setColWidthAt(vIdx, nextW);                         // persist width now
+                              setImageColScaleCssVar(normKey, nextScale);
+                              commitImgColHeightDebounced(normKey, targetH);
+                              setColWidthAt(vIdx, nextW);
                             }}
                           >
                             <Minus className="h-3 w-3" />
@@ -1543,21 +2105,37 @@ export default function Viewer() {
                             onClick={(e) => {
                               e.stopPropagation();
                               const nextW = colWidth + STEP.width;
-                              setCssVar(`--col-${vIdx}-w`, `${Math.min(SIZING.colMax, nextW)}px`);
+                              setCssVar(
+                                `--col-${vIdx}-w`,
+                                `${Math.min(SIZING.colMax, nextW)}px`
+                              );
 
-                              const baseHStr = getComputedStyle(document.documentElement)
-                                .getPropertyValue(`--imgcol-${normKey}-h`).trim();
-                              const baseH = parseInt(baseHStr || `${imgColBaseH}`, 10);
-                              const currentScaleStr = getComputedStyle(document.documentElement)
-                                .getPropertyValue(`--imgcol-${normKey}-scale`).trim();
-                              const currentScale = parseFloat(currentScaleStr || "1") || 1;
+                              const baseHStr = getComputedStyle(
+                                document.documentElement
+                              )
+                                .getPropertyValue(`--imgcol-${normKey}-h`)
+                                .trim();
+                              const baseH = parseInt(
+                                baseHStr || `${imgColBaseH}`,
+                                10
+                              );
+                              const currentScaleStr = getComputedStyle(
+                                document.documentElement
+                              )
+                                .getPropertyValue(`--imgcol-${normKey}-scale`)
+                                .trim();
+                              const currentScale =
+                                parseFloat(currentScaleStr || "1") || 1;
                               const currentH = baseH * currentScale;
-                              const targetH = Math.min(SIZING.rowMax, currentH + STEP.height);
+                              const targetH = Math.min(
+                                SIZING.rowMax,
+                                currentH + STEP.height
+                              );
                               const nextScale = targetH / baseH;
 
-                              setImageColScaleCssVar(normKey, nextScale);       // immediate smooth visual
-                              commitImgColHeightDebounced(normKey, targetH);     // commit base height later
-                              setColWidthAt(vIdx, nextW);                         // persist width now
+                              setImageColScaleCssVar(normKey, nextScale);
+                              commitImgColHeightDebounced(normKey, targetH);
+                              setColWidthAt(vIdx, nextW);
                             }}
                           >
                             <PlusIcon className="h-3 w-3" />
@@ -1604,7 +2182,11 @@ export default function Viewer() {
                     e.preventDefault();
                     const idx = 2 + orig.length;
                     const startW = colWidths[idx] || SIZING.defaults.total;
-                    setDraggingCol({ index: idx, startX: e.clientX, startWidth: startW });
+                    setDraggingCol({
+                      index: idx,
+                      startX: e.clientX,
+                      startWidth: startW,
+                    });
                   }}
                   style={{
                     position: "absolute",
@@ -1622,7 +2204,8 @@ export default function Viewer() {
           <tbody>
             {items.map((it, rowIdx) => {
               const map =
-                (rowSelectionByCategory && rowSelectionByCategory[active]) ||
+                (rowSelectionByCategory &&
+                  rowSelectionByCategory[active as string]) ||
                 {};
               const selected = map[it.ID] === undefined ? true : !!map[it.ID];
 
@@ -1667,7 +2250,10 @@ export default function Viewer() {
 
                   {/* ID */}
                   <td className="relative p-2 border-r align-top font-mono text-xs bg-gray-100 group-hover:bg-blue-50">
-                    <div className="truncate" style={{ maxHeight: contentMaxH }}>
+                    <div
+                      className="truncate"
+                      style={{ maxHeight: contentMaxH }}
+                    >
                       {it.ID}
                     </div>
                   </td>
@@ -1685,10 +2271,11 @@ export default function Viewer() {
 
                     const visualIdx = 2 + colIndex;
                     const cellWidthVar = `var(--col-${visualIdx}-w, ${
-                      (getColWidths()[visualIdx] || SIZING.defaults.data)
+                      getColWidths()[visualIdx] || SIZING.defaults.data
                     }px)`;
                     const cellWidth =
-                      (getColWidths()[visualIdx] || SIZING.defaults.data) - CELL_PADDING * 2;
+                      (getColWidths()[visualIdx] || SIZING.defaults.data) -
+                      CELL_PADDING * 2;
 
                     const isImgCol = imageColumns.has(nkey);
                     const imgColHeightVar = `var(--imgcol-${nkey}-h, ${SIZING.defaults.imageColHeight}px)`;
@@ -1715,7 +2302,9 @@ export default function Viewer() {
                             className="text-xs flex items-center gap-2"
                             style={{
                               width: "100%",
-                              maxHeight: isImgCol ? imgColHeightVar : textCellHeight,
+                              maxHeight: isImgCol
+                                ? imgColHeightVar
+                                : textCellHeight,
                               overflow: "hidden",
                             }}
                           >
@@ -1842,15 +2431,12 @@ export default function Viewer() {
 
         {/* Context menus */}
         <ColumnContextMenu />
-        <RowContextMenu />
-
-        {/* Modals */}
-        {InsertImageModal}
+        {/* Row context menu uses Insert image modal button */}
       </div>
     );
   }
 
-  // Editing save helper
+   // Editing save helper
   async function saveEdit(id, normKey, newValue) {
     const original = editingCell
       ? editingCell.original == null
@@ -2354,29 +2940,29 @@ export default function Viewer() {
       </div>
     </div>
   ) : null;
-
-  // JSX
   return (
-    <div className="max-w-7xl mx-auto p-4">
-      <header className="mb-6 flex items-start justify-between">
+    <div className="w-full px-4">
+      <header className="mb-4 flex items-start justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Inventory Viewer</h1>
           <p className="text-sm text-gray-500 mt-1">
             Right-click headers to Add column (left/right). Right-click a data
-            cell to Add row (top/bottom), Delete row, or Insert image.
-            Drag header edges to resize columns, and drag the small bar under the left cell of a row to resize height.
-            Image columns show +/- controls; width changes are immediate, height changes animate smoothly.
+            cell to Add row (top/bottom), Delete row, or Insert image. Drag
+            header edges to resize columns, and drag the small bar under the
+            left cell of a row to resize height. Image columns show +/-
+            controls; width changes are immediate, height changes animate
+            smoothly.
           </p>
         </div>
         {headerControls()}
       </header>
 
-      <div className="mb-4 flex items-center gap-3">
+      <div className="mb-3 flex items-center gap-2">
         <div className="font-medium">Categories:</div>
         {loadingCats ? (
           <div className="text-sm text-gray-500">Loading...</div>
         ) : (
-          <div className="flex gap-3 overflow-auto">
+          <div className="flex gap-2 overflow-auto w-full">
             {categories.map((c) => (
               <div
                 key={c.name}
@@ -2397,10 +2983,11 @@ export default function Viewer() {
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    setPendingDeleteCategory(c.name);
+                    setDeletingCategory(c.name);
                   }}
                   className="ml-2 inline-flex items-center justify-center w-8 h-8 rounded-full bg-red-100 hover:bg-red-200"
                   title={`Delete category ${c.name}`}
+                  disabled={!!deletingCategory} // disable while confirm modal is open
                 >
                   <Trash2 className="h-4 w-4 text-red-600" />
                 </button>
@@ -2410,10 +2997,10 @@ export default function Viewer() {
         )}
       </div>
 
-      {error && <div className="mb-4 text-sm text-red-600">{error}</div>}
+      {error && <div className="mb-3 text-sm text-red-600">{error}</div>}
 
       <main>
-        <div className="mb-4 relative">
+        <div className="mb-3 relative">
           <h2 className="text-lg font-medium mb-2">
             {active || "No category selected"}
           </h2>
@@ -2422,8 +3009,7 @@ export default function Viewer() {
           ) : (
             renderTable()
           )}
-
-          {/* Modals */}
+           {/* Modals */}
           {InsertColumnModal}
           {InsertRowModal}
           {InsertImageModal}
@@ -2434,7 +3020,47 @@ export default function Viewer() {
         </div>
       </main>
 
-      {/* Delete Column Modal */}
+      {deletingCategory && typeof deletingCategory === "string" && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
+          onClick={() => setDeletingCategory(false)}
+        >
+          <div
+            className="bg-white rounded-lg shadow-lg p-4 max-w-sm w-full"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="font-semibold text-lg mb-2">Delete category</h3>
+            <div className="text-sm text-gray-700 mb-4">
+              Are you sure you want to delete the category "
+              <strong>{deletingCategory}</strong>"? This will remove all of its
+              items.
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setDeletingCategory(false)}
+                className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={deleteCategoryConfirmed}
+                className="px-3 py-1 rounded bg-red-600 text-white hover:bg-red-700"
+                disabled={
+                  deletingRows ||
+                  deletingColumn ||
+                  exportingAll ||
+                  exportingCategory ||
+                  replacing
+                }
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+        {/* Delete Column Modal */}
       {pendingDeleteColumn && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">
           <div className="bg-white rounded-lg shadow-lg p-6 max-w-md w-full">
@@ -2539,11 +3165,21 @@ export default function Viewer() {
 }
 
 // Tiny inline spinner component (used above)
-function Spinner({ className = "h-4 w-4 text-white" }) {
+function Spinner({ className = "h-4 w-4 text-white" }: { className?: string }) {
   return (
-    <svg className={`animate-spin ${className}`} viewBox="0 0 24 24" fill="none" stroke="currentColor">
+    <svg
+      className={`animate-spin ${className}`}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+    >
       <circle className="opacity-25" cx="12" cy="12" r="10" strokeWidth="3" />
-      <path className="opacity-75" d="M4 12a8 8 0 018-8" strokeWidth="3" strokeLinecap="round" />
+      <path
+        className="opacity-75"
+        d="M4 12a8 8 0 018-8"
+        strokeWidth="3"
+        strokeLinecap="round"
+      />
     </svg>
   );
 }

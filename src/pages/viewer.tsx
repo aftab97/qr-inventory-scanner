@@ -1395,6 +1395,17 @@ export default function Viewer() {
     }
   }
 
+  function colNumberToLetter(n: number) {
+    // 1 -> A, 2 -> B ...
+    let s = "";
+    while (n > 0) {
+      const m = (n - 1) % 26;
+      s = String.fromCharCode(65 + m) + s;
+      n = Math.floor((n - 1) / 26);
+    }
+    return s;
+  }
+
   async function addSheetWithImages({
     workbook,
     sheetName,
@@ -1405,7 +1416,7 @@ export default function Viewer() {
     rowSelectionMap,
     exportSelectedOnly,
     includeTotalsRow,
-    colWidthsPx, // UI widths
+    colWidthsPx,
   }: {
     workbook: ExcelJS.Workbook;
     sheetName: string;
@@ -1422,25 +1433,41 @@ export default function Viewer() {
 
     // Build headers for Excel: DO NOT include "Sel"
     const headers: string[] = [];
-    if (selection["id"]) headers.push("ID");
-    for (let i = 0; i < headerOrig.length; i++) {
-      if (selection[headerNorm[i]]) headers.push(headerOrig[i]);
+    const excelColIndexes: number[] = []; // maps data index -> excel column index
+    let excelColCounter = 0;
+
+    if (selection["id"]) {
+      headers.push("ID");
+      excelColCounter++;
     }
-    if (selection["total"]) headers.push("Total");
+
+    for (let i = 0; i < headerOrig.length; i++) {
+      if (selection[headerNorm[i]]) {
+        headers.push(headerOrig[i]);
+        excelColIndexes[i] = ++excelColCounter;
+      } else {
+        excelColIndexes[i] = -1; // skipped
+      }
+    }
+
+    let totalColIdx = -1;
+    if (selection["total"]) {
+      headers.push("Total");
+      totalColIdx = ++excelColCounter;
+    }
+
     worksheet.addRow(headers);
 
-    // Column widths from UI widths (skip "Sel")
+    // Column widths from UI widths (skip "Sel" since not in Excel)
     const columns: ExcelJS.Column[] = [];
-    // ID width (UI index 1)
     if (selection["id"]) {
       columns.push({
         width: excelColWidthFromPx(colWidthsPx?.[1] || SIZING.defaults.id),
       });
     }
-    // Data columns (UI index 2..)
     for (let i = 0; i < headerOrig.length; i++) {
       if (selection[headerNorm[i]]) {
-        const vIdx = 2 + i; // UI visual index for this column
+        const vIdx = 2 + i; // visual UI index
         columns.push({
           width: excelColWidthFromPx(
             colWidthsPx?.[vIdx] || SIZING.defaults.data
@@ -1448,7 +1475,6 @@ export default function Viewer() {
         });
       }
     }
-    // Total column (UI index 2 + headerOrig.length)
     if (selection["total"]) {
       const vIdx = 2 + headerOrig.length;
       columns.push({
@@ -1465,7 +1491,24 @@ export default function Viewer() {
       filteredItems = itemsArr.filter((it) => !!rowSelectionMap[it.ID]);
     }
 
+    // Helper: cells to sum for a given row
+    function getRowSumCellRefs(rowNumber: number): string[] {
+      const refs: string[] = [];
+      for (let i = 0; i < headerOrig.length; i++) {
+        if (!selection[headerNorm[i]]) continue;
+        const excelCol = excelColIndexes[i];
+        if (excelCol && excelCol > 0) {
+          refs.push(`${colNumberToLetter(excelCol)}${rowNumber}`);
+        }
+      }
+      // Exclude ID and Total columns from the row SUM (we add only data columns above)
+      return refs;
+    }
+
     // Add rows and collect image cells for embedding
+    const dataRowStart = 2; // first data row after header (header is row 1)
+    let currentRow = dataRowStart;
+
     for (const it of filteredItems) {
       const rowVals: Array<number | string | null> = [];
 
@@ -1484,22 +1527,37 @@ export default function Viewer() {
         const rawVal = it[nk];
         const imgObj = parseImageValue(rawVal);
         if (imgObj?.src) {
-          // Leave cell empty; image overlays
-          rowVals.push("");
+          rowVals.push(""); // placeholder
+          // colIndexInExcel = rowVals.length (1-based)
           imageCells.push({ colIndexInExcel: rowVals.length, imgObj });
         } else {
-          // Coerce numeric where applicable
           const coerced = toNumberIfNumeric(rawVal);
           rowVals.push(coerced === undefined ? "" : coerced);
         }
       }
 
+      // push placeholder for Total; we'll set a formula after adding row
       if (selection["total"]) {
-        rowVals.push(computeTotalForItem(it, headerNorm)); // numeric
+        rowVals.push(""); // placeholder for formula
       }
 
       const newRow = worksheet.addRow(rowVals);
       newRow.height = Math.max(20, Math.round(getRowHeightById(it.ID) / 1.6));
+
+      // Compute and set SUM formula for the Total cell of this row
+      if (selection["total"] && totalColIdx > 0) {
+        const sumRefs = getRowSumCellRefs(newRow.number);
+        if (sumRefs.length > 0) {
+          const firstRef = sumRefs[0];
+          const lastRef = sumRefs[sumRefs.length - 1];
+          // If columns are contiguous, we can use A2:K2. If not, join with SUM(A2,B2,...) is fine.
+          // To be robust with skipped columns, use SUM with a comma-separated list.
+          const formula = `SUM(${sumRefs.join(",")})`;
+          worksheet.getCell(newRow.number, totalColIdx).value = { formula };
+        } else {
+          worksheet.getCell(newRow.number, totalColIdx).value = "";
+        }
+      }
 
       // Track tallest image for row to bump row height afterwards
       let maxImageHeightForRowPx = 0;
@@ -1511,9 +1569,7 @@ export default function Viewer() {
         const { ab, contentType } = await fetchImageArrayBufferWithCT(url);
         if (!ab) continue;
 
-        // Read intrinsic dimensions to preserve aspect ratio
         const dims = await getImageDimensionsFromBuffer(ab);
-        // If we don't get dimensions, assume square
         const intrinsicW = dims?.width ?? 1;
         const intrinsicH = dims?.height ?? 1;
         const aspectRatio = intrinsicH / intrinsicW;
@@ -1524,76 +1580,75 @@ export default function Viewer() {
           extension: ext as any,
         });
 
-        // Column index counting from Excel headers (no "Sel" in Excel)
         const colIdx1Based = cell.colIndexInExcel;
         const rowIdx1Based = newRow.number;
 
-        // Current column width (characters and px)
         const excelCol = worksheet.columns[colIdx1Based - 1];
         const currentChars = excelCol?.width || 10;
         const currentPxWidth = charsToPx(currentChars);
 
-        // Enforce minimum image width: 2 inches = 192 px
         const targetPxWidth = Math.max(MIN_IMAGE_WIDTH_PX, currentPxWidth);
-
-        // Compute height strictly by aspect ratio; do NOT cap by row height
         const finalHeightPx = Math.max(
           24,
           Math.round(targetPxWidth * aspectRatio)
         );
 
-        // Widen column if needed to fit target width
         if (currentPxWidth < targetPxWidth) {
           worksheet.columns[colIdx1Based - 1].width = pxToChars(targetPxWidth);
         }
 
-        // Add the image anchored to the single cell
         worksheet.addImage(imageId, {
           tl: { col: colIdx1Based - 1, row: rowIdx1Based - 1 },
-          ext: {
-            width: Math.max(24, targetPxWidth),
-            height: finalHeightPx,
-          },
+          ext: { width: Math.max(24, targetPxWidth), height: finalHeightPx },
           editAs: "oneCell",
         });
 
-        // Track tallest image to adjust row height later so it doesn't clip
         maxImageHeightForRowPx = Math.max(
           maxImageHeightForRowPx,
           finalHeightPx
         );
       }
 
-      // Bump row height to fit tallest image in this row
       if (maxImageHeightForRowPx > 0) {
-        // ExcelJS row height uses points; ~1 px ≈ 0.75 points
         const pointsPerPx = 0.75;
         const neededPoints = Math.round(maxImageHeightForRowPx * pointsPerPx);
         newRow.height = Math.max(newRow.height || 20, neededPoints);
       }
+
+      currentRow++;
     }
 
-    // Totals row
+    // Totals row (footer): write a SUM down the Total column, and for each data column write SUM down that column
     if (includeTotalsRow) {
-      const colTotals = computeColumnTotalsForItems(filteredItems, headerNorm);
-      const totalsRow: Array<number | string> = [];
-      if (selection["id"]) totalsRow.push(""); // leave ID totals blank
+      const totalsRow = worksheet.addRow([]);
+      totalsRow.font = { bold: true };
+      totalsRow.height = Math.max(18, Math.round(SIZING.defaults.row / 1.8));
+
+      const firstDataRow = dataRowStart;
+      const lastDataRow = currentRow - 1;
+
+      // ID totals blank
+      let colCursor = 1;
+      if (selection["id"]) {
+        worksheet.getCell(totalsRow.number, colCursor).value = "";
+        colCursor++;
+      }
+
+      // For each selected data column, SUM down the column
       for (let i = 0; i < headerOrig.length; i++) {
-        const nk = headerNorm[i];
-        if (!selection[nk]) continue;
-        const v = colTotals[nk];
-        totalsRow.push(v == null ? "" : v);
+        if (!selection[headerNorm[i]]) continue;
+        const excelCol = excelColIndexes[i];
+        const colLetter = colNumberToLetter(excelCol);
+        const formula = `SUM(${colLetter}${firstDataRow}:${colLetter}${lastDataRow})`;
+        worksheet.getCell(totalsRow.number, excelCol).value = { formula };
       }
-      if (selection["total"]) {
-        const totOfTotals = filteredItems.reduce(
-          (acc, it) => acc + computeTotalForItem(it, headerNorm),
-          0
-        );
-        totalsRow.push(totOfTotals);
+
+      // Total column: SUM down the Total column
+      if (selection["total"] && totalColIdx > 0) {
+        const totalColLetter = colNumberToLetter(totalColIdx);
+        const formula = `SUM(${totalColLetter}${firstDataRow}:${totalColLetter}${lastDataRow})`;
+        worksheet.getCell(totalsRow.number, totalColIdx).value = { formula };
       }
-      const row = worksheet.addRow(totalsRow);
-      row.font = { bold: true };
-      row.height = Math.max(18, Math.round(SIZING.defaults.row / 1.8));
     }
 
     // Style header row
@@ -2436,7 +2491,7 @@ export default function Viewer() {
     );
   }
 
-   // Editing save helper
+  // Editing save helper
   async function saveEdit(id, normKey, newValue) {
     const original = editingCell
       ? editingCell.original == null
@@ -3009,7 +3064,7 @@ export default function Viewer() {
           ) : (
             renderTable()
           )}
-           {/* Modals */}
+          {/* Modals */}
           {InsertColumnModal}
           {InsertRowModal}
           {InsertImageModal}
@@ -3060,7 +3115,7 @@ export default function Viewer() {
         </div>
       )}
 
-        {/* Delete Column Modal */}
+      {/* Delete Column Modal */}
       {pendingDeleteColumn && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">
           <div className="bg-white rounded-lg shadow-lg p-6 max-w-md w-full">

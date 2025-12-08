@@ -715,7 +715,7 @@ export default function Viewer() {
   // Column delete
   function isProtectedColumn(orig) {
     const n = String(orig || "").trim().toLowerCase();
-    return n === "nom" || n === "nombre" || n === "pierres" || n === "piedras";
+    return false;
   }
   async function confirmDeleteColumn() {
     if (!active || !pendingDeleteColumn) {
@@ -1079,7 +1079,7 @@ export default function Viewer() {
       </div>
     );
   }
-  
+
   const imageColumns = useMemo(() => {
     const norm = headerNormalizedOrder();
     const set = new Set();
@@ -1963,16 +1963,6 @@ export default function Viewer() {
         >
           {replacing ? <Spinner className="h-4 w-4 text-white" /> : null}
           <span>{replacing ? "Replacing…" : "Replace Category"}</span>
-        </button>
-
-        {/* Quick add column at end */}
-        <button
-          onClick={() => openInsertColumnAt(headerOriginalOrder().length)}
-          className="px-3 py-1 bg-indigo-600 text-white rounded flex items-center gap-2 hover:bg-indigo-700"
-          disabled={!active}
-        >
-          <Plus className="h-4 w-4" />
-          <span>Add column (end)</span>
         </button>
 
         <input

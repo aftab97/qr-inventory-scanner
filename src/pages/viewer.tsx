@@ -1,17 +1,14 @@
-/* PATCH: Images now always insert with width/height set to "auto".
-   PATCH: Removed user inputs for image width/height from the Insert Image modal.
-   PATCH: Rendering continues to auto-fit images to the cell (column width and per-image-column height).
-   All other functionality remains unchanged. */
+/* Performance refactor v2 (height scaling via transform):
+   - Column width: smooth via CSS variables and requestAnimationFrame (as before).
+   - Image column height: animated via transform: scaleY on a fixed-height container (GPU-friendly, avoids layout reflow).
+   - Debounced commit: after interaction, set the column's base height CSS var to the target height and reset scale to 1; persist to React state/localStorage without jank.
+   - Images auto-fit (width/height "auto"); <img> uses decoding="async" and loading="lazy".
+   - Existing functionality preserved (context menus, insert/delete, export, etc.).
+*/
 
-import React, { useEffect, useRef, useState, useMemo } from "react";
-import {
-  Trash2,
-  Plus,
-  Image as ImageIcon,
-  Minus,
-  Plus as PlusIcon,
-} from "lucide-react";
-import * as XLSX from "xlsx"; // kept for non-image export paths if needed
+import React, { useEffect, useRef, useState, useMemo, useCallback } from "react";
+import { Trash2, Plus, Image as ImageIcon, Minus, Plus as PlusIcon } from "lucide-react";
+import * as XLSX from "xlsx";
 import { isLocalHost } from "../api";
 
 const API_BASE = isLocalHost
@@ -25,65 +22,6 @@ const LS_COL_WIDTHS_KEY = "qr_viewer_col_widths_v2";
 const LS_ROW_HEIGHTS_KEY = "qr_viewer_row_heights_v2";
 const LS_IMAGE_COL_HEIGHTS_KEY = "qr_viewer_image_col_heights_v1";
 
-/**
- * Viewer.jsx
- *
- * Right-click:
- * - Header cell: "Add column (left/right)" (not on ID).
- * - Body cell: "Add row (top/bottom)", "Delete row", "Insert image".
- *   Image insertion allowed on ANY column.
- *
- * Resize:
- * - Drag the vertical handle on header cells to change column widths.
- * - Drag the horizontal handle at the bottom of each row (left "Sel" column) to change row height.
- * - Images expand with the cell size. Images are always stored and rendered with width/height "auto".
- *
- * Image columns auto-controls:
- * - We autodetect columns containing images.
- * - For detected image columns, header shows +/- controls to increase/decrease:
- *   - Column width (affects all cells in that column)
- *   - Column image height (affects image rendering height for all cells in that column)
- * - These adjustments are persisted in LocalStorage per category.
- */
-
-function Spinner({ className = "h-4 w-4 text-white" }) {
-  return (
-    <svg
-      className={`animate-spin ${className}`}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-    >
-      <circle className="opacity-25" cx="12" cy="12" r="10" strokeWidth="3" />
-      <path
-        className="opacity-75"
-        d="M4 12a8 8 0 018-8"
-        strokeWidth="3"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
-
-// UUID v4
-function uuidv4() {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-    const r = crypto.getRandomValues(new Uint8Array(1))[0] & 0xf;
-    const v = c === "x" ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
-
-// Try parse image JSON
-function parseImageValue(val) {
-  if (!val || typeof val !== "string") return null;
-  try {
-    const obj = JSON.parse(val);
-    if (obj && obj.type === "image" && obj.src) return obj;
-  } catch {}
-  return null;
-}
-
 // Sizing defaults
 const SIZING = {
   colMin: 60,
@@ -96,14 +34,50 @@ const SIZING = {
     data: 180,
     total: 140,
     row: 56,
-    imageColHeight: 128, // default image height for image columns
+    imageColHeight: 128,
   },
 };
-const CELL_PADDING = 8; // px (Tailwind p-2)
-const STEP = {
-  width: 40, // px per click for width
-  height: 40, // px per click for image height control
-};
+const CELL_PADDING = 8;
+const STEP = { width: 40, height: 40 };
+
+// UUID v4
+function uuidv4() {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = crypto.getRandomValues(new Uint8Array(1))[0] & 0xf;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+// Parse image JSON
+function parseImageValue(val) {
+  if (!val || typeof val !== "string") return null;
+  try {
+    const obj = JSON.parse(val);
+    if (obj && obj.type === "image" && obj.src) return obj;
+  } catch {}
+  return null;
+}
+
+// Utils
+function norm(s) {
+  return String(s || "").trim().toLowerCase();
+}
+
+// Debounce helper
+function useDebouncedCallback(fn, delay) {
+  const timerRef = useRef(null);
+  return useCallback(
+    (...args) => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        timerRef.current = null;
+        fn(...args);
+      }, delay);
+    },
+    [fn, delay]
+  );
+}
 
 export default function Viewer() {
   // Data
@@ -112,7 +86,7 @@ export default function Viewer() {
   const [items, setItems] = useState([]);
   const [schema, setSchema] = useState(null);
 
-  // UI state / flags
+  // UI flags
   const [loadingCats, setLoadingCats] = useState(false);
   const [loadingItems, setLoadingItems] = useState(false);
   const [replacing, setReplacing] = useState(false);
@@ -134,21 +108,17 @@ export default function Viewer() {
   const [pendingReplaceFile, setPendingReplaceFile] = useState(null);
   const [confirmReplaceOpen, setConfirmReplaceOpen] = useState(false);
 
-  // Delete column modal
+  // Column/Row delete modals
   const [pendingDeleteColumn, setPendingDeleteColumn] = useState(null);
-  // Delete rows modal
   const [pendingDeleteRowIds, setPendingDeleteRowIds] = useState([]);
   const [confirmDeleteRowsOpen, setConfirmDeleteRowsOpen] = useState(false);
-  // Delete category modal
-  const [pendingDeleteCategory, setPendingDeleteCategory] = useState(null);
 
-  // Insert column modal state
+  // Insert column/row modals
   const [insertColumnOpen, setInsertColumnOpen] = useState(false);
   const [newColumnName, setNewColumnName] = useState("");
   const [insertColumnIndex, setInsertColumnIndex] = useState(0);
   const [insertingColumn, setInsertingColumn] = useState(false);
 
-  // Insert row modal state
   const [insertRowOpen, setInsertRowOpen] = useState(false);
   const [insertRowIndex, setInsertRowIndex] = useState(0);
   const [insertingRow, setInsertingRow] = useState(false);
@@ -157,19 +127,17 @@ export default function Viewer() {
   const [newRowIdChecking, setNewRowIdChecking] = useState(false);
   const [newRowIdExists, setNewRowIdExists] = useState(false);
 
-  // Insert image modal state
+  // Insert image modal
   const [insertImageOpen, setInsertImageOpen] = useState(false);
   const [insertImageTarget, setInsertImageTarget] = useState(null); // { id, normKey }
   const [imageUploadMode, setImageUploadMode] = useState("upload"); // 'upload' | 'url'
   const [imageFile, setImageFile] = useState(null);
   const [imageUrl, setImageUrl] = useState("");
   const [imageAlt, setImageAlt] = useState("");
-  const [imageWidth, setImageWidth] = useState();
-  const [imageHeight, setImageHeight] = useState();
   const [uploadingImage, setUploadingImage] = useState(false);
   const [imagePreviewUrl, setImagePreviewUrl] = useState("");
 
-  // Context menus
+  // Context menu
   const [ctxMenu, setCtxMenu] = useState({
     open: false,
     x: 0,
@@ -183,7 +151,7 @@ export default function Viewer() {
     cellNormKey: null,
   });
 
-  // Persisted selections
+  // Selections
   const [columnSelectionByCategory, setColumnSelectionByCategory] = useState(
     () => {
       try {
@@ -227,7 +195,7 @@ export default function Viewer() {
     } catch {}
   }, [rowSelectionByCategory]);
 
-  // ----------------- Column widths and Row heights state -----------------
+  // Column widths and row heights (persisted)
   const [colWidthsByCategory, setColWidthsByCategory] = useState(() => {
     try {
       const raw = window.localStorage.getItem(LS_COL_WIDTHS_KEY);
@@ -244,25 +212,6 @@ export default function Viewer() {
       return {};
     }
   });
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(
-        LS_COL_WIDTHS_KEY,
-        JSON.stringify(colWidthsByCategory)
-      );
-    } catch {}
-  }, [colWidthsByCategory]);
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(
-        LS_ROW_HEIGHTS_KEY,
-        JSON.stringify(rowHeightsByCategory)
-      );
-    } catch {}
-  }, [rowHeightsByCategory]);
-
-  // NEW: per-category per-column image target heights (overrides row height for image render)
   const [imageColHeightsByCategory, setImageColHeightsByCategory] = useState(
     () => {
       try {
@@ -273,15 +222,39 @@ export default function Viewer() {
       }
     }
   );
-  useEffect(() => {
+
+  const persistColWidthsDebounced = useDebouncedCallback((next) => {
+    try {
+      window.localStorage.setItem(LS_COL_WIDTHS_KEY, JSON.stringify(next));
+    } catch {}
+  }, 200);
+
+  const persistRowHeightsDebounced = useDebouncedCallback((next) => {
+    try {
+      window.localStorage.setItem(LS_ROW_HEIGHTS_KEY, JSON.stringify(next));
+    } catch {}
+  }, 200);
+
+  const persistImageColHeightsDebounced = useDebouncedCallback((next) => {
     try {
       window.localStorage.setItem(
         LS_IMAGE_COL_HEIGHTS_KEY,
-        JSON.stringify(imageColHeightsByCategory)
+        JSON.stringify(next)
       );
     } catch {}
-  }, [imageColHeightsByCategory]);
+  }, 200);
 
+  useEffect(() => {
+    persistColWidthsDebounced(colWidthsByCategory);
+  }, [colWidthsByCategory, persistColWidthsDebounced]);
+  useEffect(() => {
+    persistRowHeightsDebounced(rowHeightsByCategory);
+  }, [rowHeightsByCategory, persistRowHeightsDebounced]);
+  useEffect(() => {
+    persistImageColHeightsDebounced(imageColHeightsByCategory);
+  }, [imageColHeightsByCategory, persistImageColHeightsDebounced]);
+
+  // Helpers: header orders
   function headerOriginalOrder() {
     if (schema?.headerOriginalOrder?.length) return schema.headerOriginalOrder;
     if (!items?.length) return [];
@@ -293,10 +266,10 @@ export default function Viewer() {
     return headerOriginalOrder().map((h) => String(h).toLowerCase());
   }
   function getVisualColumnCount() {
-    return (
-      1 /* Sel */ + 1 /* ID */ + headerOriginalOrder().length + 1 /* Total */
-    );
+    return 1 + 1 + headerOriginalOrder().length + 1; // Sel + ID + data + Total
   }
+
+  // Ensure widths array shape
   function ensureColWidthsForActive() {
     if (!active) return;
     const count = getVisualColumnCount();
@@ -327,14 +300,17 @@ export default function Viewer() {
   }
   function setColWidthAt(index, width) {
     if (!active) return;
+    const clamped = Math.max(
+      SIZING.colMin,
+      Math.min(SIZING.colMax, Math.round(width))
+    );
     setColWidthsByCategory((prev) => {
       const arr = (prev[active] || []).slice();
-      arr[index] = Math.max(
-        SIZING.colMin,
-        Math.min(SIZING.colMax, Math.round(width))
-      );
+      arr[index] = clamped;
       return { ...prev, [active]: arr };
     });
+    // Also set CSS variable for immediate visual update
+    setCssVar(`--col-${index}-w`, `${clamped}px`);
   }
   function getRowHeightById(id) {
     if (!active || !id) return SIZING.defaults.row;
@@ -346,15 +322,18 @@ export default function Viewer() {
   }
   function setRowHeightById(id, height) {
     if (!active || !id) return;
+    const clamped = Math.max(
+      SIZING.rowMin,
+      Math.min(SIZING.rowMax, Math.round(height))
+    );
     setRowHeightsByCategory((prev) => {
       const map = { ...(prev[active] || {}) };
-      map[id] = Math.max(
-        SIZING.rowMin,
-        Math.min(SIZING.rowMax, Math.round(height))
-      );
+      map[id] = clamped;
       return { ...prev, [active]: map };
     });
   }
+
+  // Image column height: base height from state; transform scaleY for live updates
   function getImageColHeight(normKey) {
     if (!active || !normKey) return SIZING.defaults.imageColHeight;
     const perCat = imageColHeightsByCategory[active] || {};
@@ -364,19 +343,64 @@ export default function Viewer() {
       Math.min(SIZING.rowMax, Number(h || SIZING.defaults.imageColHeight))
     );
   }
-  function setImageColHeight(normKey, height) {
-    if (!active || !normKey) return;
-    setImageColHeightsByCategory((prev) => {
-      const perCat = { ...(prev[active] || {}) };
-      perCat[normKey] = Math.max(
+  const persistImgColHeightDebounced = useDebouncedCallback(
+    (normKey, height) => {
+      if (!active || !normKey) return;
+      const clamped = Math.max(
         SIZING.rowMin,
         Math.min(SIZING.rowMax, Math.round(height))
       );
-      return { ...prev, [active]: perCat };
+      setImageColHeightsByCategory((prev) => {
+        const perCat = { ...(prev[active] || {}) };
+        perCat[normKey] = clamped;
+        return { ...prev, [active]: perCat };
+      });
+    },
+    120
+  );
+  function setImageColHeightCssVar(normKey, heightPx) {
+    const clamped = Math.max(
+      SIZING.rowMin,
+      Math.min(SIZING.rowMax, Math.round(heightPx))
+    );
+    setCssVar(`--imgcol-${normKey}-h`, `${clamped}px`);
+  }
+
+  // Scale vars for image columns
+  const imgColScaleRef = useRef({}); // { normKey: scale }
+  function setImageColScaleCssVar(normKey, scale) {
+    const s = Math.max(0.1, Math.min(10, scale)); // clamp
+    imgColScaleRef.current[normKey] = s;
+    setCssVar(`--imgcol-${normKey}-scale`, String(s));
+  }
+  const commitImgColHeightDebounced = useDebouncedCallback(
+    (normKey, targetHeightPx) => {
+      // Commit base height, reset scale to 1, and persist to state/localStorage
+      setImageColHeightCssVar(normKey, targetHeightPx);
+      setImageColScaleCssVar(normKey, 1);
+      persistImgColHeightDebounced(normKey, targetHeightPx);
+    },
+    120
+  );
+
+  // requestAnimationFrame scheduling for smooth CSS var updates
+  const rafIdRef = useRef(null);
+  const pendingUpdateRef = useRef({}); // { [`--var`]: value }
+
+  function setCssVar(name, value) {
+    pendingUpdateRef.current[name] = value;
+    if (rafIdRef.current) return;
+    rafIdRef.current = requestAnimationFrame(() => {
+      const entries = Object.entries(pendingUpdateRef.current);
+      entries.forEach(([n, v]) => {
+        document.documentElement.style.setProperty(n, v);
+      });
+      pendingUpdateRef.current = {};
+      rafIdRef.current = null;
     });
   }
 
-  // Drag state
+  // Drag state (column/row)
   const [draggingCol, setDraggingCol] = useState(null); // { index, startX, startWidth }
   const [draggingRow, setDraggingRow] = useState(null); // { id, startY, startHeight }
 
@@ -384,13 +408,27 @@ export default function Viewer() {
     function onMove(e) {
       if (draggingCol) {
         const delta = e.clientX - draggingCol.startX;
-        setColWidthAt(draggingCol.index, draggingCol.startWidth + delta);
+        const next = draggingCol.startWidth + delta;
+        const clamped = Math.max(SIZING.colMin, Math.min(SIZING.colMax, next));
+        // CSS var only during drag
+        setCssVar(`--col-${draggingCol.index}-w`, `${clamped}px`);
       } else if (draggingRow) {
         const delta = e.clientY - draggingRow.startY;
-        setRowHeightById(draggingRow.id, draggingRow.startHeight + delta);
+        const next = draggingRow.startHeight + delta;
+        const clamped = Math.max(SIZING.rowMin, Math.min(SIZING.rowMax, next));
+        // Update row height state (affects only that row)
+        setRowHeightById(draggingRow.id, clamped);
       }
     }
     function onUp() {
+      if (draggingCol) {
+        // Persist final column width to React state
+        const computed = getComputedStyle(document.documentElement)
+          .getPropertyValue(`--col-${draggingCol.index}-w`)
+          .trim();
+        const val = parseInt(computed || `${draggingCol.startWidth}`, 10);
+        setColWidthAt(draggingCol.index, val || draggingCol.startWidth);
+      }
       setDraggingCol(null);
       setDraggingRow(null);
     }
@@ -404,7 +442,7 @@ export default function Viewer() {
     }
   }, [draggingCol, draggingRow]);
 
-  // Close context menu on Escape or global click
+  // Context menu global close
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === "Escape") setCtxMenu((p) => ({ ...p, open: false }));
@@ -428,12 +466,18 @@ export default function Viewer() {
     if (active) loadCategoryItems(active);
   }, [active]);
 
-  // Recompute column widths array when schema/items change
   useEffect(() => {
     ensureColWidthsForActive();
+    // Initialize CSS vars
+    const widths = getColWidths();
+    widths.forEach((w, i) => setCssVar(`--col-${i}-w`, `${w}px`));
+    headerNormalizedOrder().forEach((nk) => {
+      setCssVar(`--imgcol-${nk}-h`, `${getImageColHeight(nk)}px`);
+      setCssVar(`--imgcol-${nk}-scale`, "1");
+    });
   }, [active, schema, items]);
 
-  // ----------------- Backend calls -----------------
+  // Backend calls
   async function loadCategories() {
     setLoadingCats(true);
     setError(null);
@@ -519,10 +563,10 @@ export default function Viewer() {
       body: JSON.stringify({ filename, contentType, ...meta }),
     });
     if (!res.ok) throw new Error(await res.text());
-    return await res.json(); // { uploadUrl, finalUrl, s3Key, expires }
+    return await res.json();
   }
 
-  // ----------------- Initialize selections -----------------
+  // Initialize selections
   function initializeSelectionForCategory(category, schemaObj, itemsArr) {
     setColumnSelectionByCategory((prev) => {
       if (prev?.[category]) return prev;
@@ -555,7 +599,7 @@ export default function Viewer() {
     });
   }
 
-  // ----------------- Column toggles -----------------
+  // Column toggles
   function toggleColumnForActive(normKey) {
     if (!active) return;
     setColumnSelectionByCategory((prev) => {
@@ -566,7 +610,7 @@ export default function Viewer() {
     });
   }
 
-  // ----------------- Row selection helpers -----------------
+  // Row selection helpers
   function toggleRowSelection(id) {
     if (!active) return;
     setRowSelectionByCategory((prev) => {
@@ -600,7 +644,7 @@ export default function Viewer() {
     return (items || []).some((it) => !!map[it.ID]);
   }
 
-  // ----------------- Delete rows bulk -----------------
+  // Bulk delete rows
   function onRequestDeleteSelectedRows() {
     if (!active) return;
     const map =
@@ -668,11 +712,9 @@ export default function Viewer() {
     }
   }
 
-  // ----------------- Column delete -----------------
+  // Column delete
   function isProtectedColumn(orig) {
-    const n = String(orig || "")
-      .trim()
-      .toLowerCase();
+    const n = String(orig || "").trim().toLowerCase();
     return n === "nom" || n === "nombre" || n === "pierres" || n === "piedras";
   }
   async function confirmDeleteColumn() {
@@ -707,10 +749,7 @@ export default function Viewer() {
           }
         );
       }
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(txt || `Server responded ${res.status}`);
-      }
+      if (!res.ok) throw new Error(await res.text());
       await loadCategoryItems(active);
       setPendingDeleteColumn(null);
     } catch (err) {
@@ -723,7 +762,7 @@ export default function Viewer() {
     }
   }
 
-  // ----------------- Insert column (modal workflow) -----------------
+  // Insert column
   function openInsertColumnAt(index) {
     setInsertColumnIndex(index);
     setNewColumnName("");
@@ -788,14 +827,10 @@ export default function Viewer() {
     }
   }
 
-  // ----------------- Context menus -----------------
+  // Context menus
   function onHeaderCellContextMenu(e, idx, label) {
     e.preventDefault();
-    const isId =
-      String(label || "")
-        .trim()
-        .toLowerCase() === "id";
-    if (isId) return;
+    if (String(label || "").trim().toLowerCase() === "id") return;
     setCtxMenu({
       open: true,
       x: e.clientX + 2,
@@ -980,6 +1015,8 @@ export default function Viewer() {
     }
   }
 
+  // Image columns autodetect
+
   function RowContextMenu() {
     if (!ctxMenu.open || ctxMenu.type !== "row" || ctxMenu.isHeaderCell)
       return null;
@@ -1042,227 +1079,7 @@ export default function Viewer() {
       </div>
     );
   }
-
-  // ----------------- Image Insert Modal -----------------
-  const InsertImageModal = insertImageOpen ? (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={() => !uploadingImage && setInsertImageOpen(false)}
-    >
-      <div
-        className="bg-white rounded-lg shadow-lg p-6 max-w-lg w-full"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 className="text-lg font-semibold mb-2">Insert image</h3>
-        <p className="text-sm text-gray-700 mb-4">
-          Set image for item <strong>{insertImageTarget?.id}</strong>, column{" "}
-          <strong>{insertImageTarget?.normKey}</strong>.
-        </p>
-
-        <div className="mb-3">
-          <div className="flex gap-2">
-            <button
-              className={`px-3 py-1 rounded ${
-                imageUploadMode === "upload"
-                  ? "bg-indigo-600 text-white"
-                  : "bg-gray-200"
-              }`}
-              onClick={() => setImageUploadMode("upload")}
-              disabled={uploadingImage}
-            >
-              Upload file
-            </button>
-            <button
-              className={`px-3 py-1 rounded ${
-                imageUploadMode === "url"
-                  ? "bg-indigo-600 text-white"
-                  : "bg-gray-200"
-              }`}
-              onClick={() => setImageUploadMode("url")}
-              disabled={uploadingImage}
-            >
-              Paste URL
-            </button>
-          </div>
-        </div>
-
-        {imageUploadMode === "upload" ? (
-          <div className="mb-3">
-            <input
-              type="file"
-              accept="image/*"
-              onChange={(e) => {
-                const f = e.target.files?.[0] ?? null;
-                setImageFile(f);
-                if (f) {
-                  const localUrl = URL.createObjectURL(f);
-                  setImagePreviewUrl(localUrl);
-                } else setImagePreviewUrl("");
-              }}
-            />
-          </div>
-        ) : (
-          <div className="mb-3">
-            <label className="block text-sm font-medium mb-1">Image URL</label>
-            <input
-              className="w-full border rounded px-2 py-2"
-              placeholder="https://example.com/image.jpg"
-              value={imageUrl}
-              onChange={(e) => {
-                setImageUrl(e.target.value);
-                setImagePreviewUrl(e.target.value);
-              }}
-            />
-          </div>
-        )}
-
-        {/* Removed width/height inputs: images default to auto */}
-        <div className="mb-3">
-          <label className="block text-sm font-medium mb-1">
-            Alt text (optional)
-          </label>
-          <input
-            className="w-full border rounded px-2 py-2"
-            placeholder="Description"
-            value={imageAlt}
-            onChange={(e) => setImageAlt(e.target.value)}
-          />
-        </div>
-
-        {imagePreviewUrl ? (
-          <div className="mb-4">
-            <div className="text-xs text-gray-600 mb-1">Preview</div>
-            <div
-              className="border rounded p-2 flex items-center justify-center"
-              style={{ maxHeight: 240 }}
-            >
-              <img
-                src={imagePreviewUrl}
-                alt={imageAlt || "preview"}
-                style={{
-                  maxWidth: "100%",
-                  maxHeight: "220px",
-                  objectFit: "contain",
-                }}
-              />
-            </div>
-          </div>
-        ) : null}
-
-        <div className="flex gap-2 justify-end">
-          <button
-            onClick={() => setInsertImageOpen(false)}
-            className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={async () => {
-              if (
-                !insertImageTarget?.id ||
-                !insertImageTarget?.normKey ||
-                !active
-              )
-                return;
-              setUploadingImage(true);
-              try {
-                let finalUrl = "";
-                let s3Key = "";
-                if (imageUploadMode === "upload") {
-                  if (!imageFile)
-                    throw new Error("Please choose an image file.");
-                  const contentType =
-                    imageFile.type || "application/octet-stream";
-                  const meta = {
-                    category: active,
-                    itemId: insertImageTarget.id,
-                    column: insertImageTarget.normKey,
-                  };
-                  const presigned = await presignUpload(
-                    imageFile.name,
-                    contentType,
-                    meta
-                  );
-                  const putRes = await fetch(presigned.uploadUrl, {
-                    method: "PUT",
-                    headers: { "Content-Type": contentType },
-                    body: imageFile,
-                  });
-                  if (!putRes.ok) throw new Error(await putRes.text());
-                  finalUrl = presigned.finalUrl || "";
-                  s3Key = presigned.s3Key || "";
-                } else {
-                  if (!imageUrl || !/^https?:\/\//i.test(imageUrl))
-                    throw new Error("Please enter a valid image URL.");
-                  finalUrl = imageUrl.trim();
-                }
-
-                // Always auto width/height
-                const payload = {
-                  type: "image",
-                  src: finalUrl,
-                  alt: imageAlt || "",
-                  width: "auto",
-                  height: "auto",
-                  ...(s3Key ? { s3Key } : {}),
-                };
-                const valueStr = JSON.stringify(payload);
-
-                // Save to cell
-                const res = await fetch(
-                  `${API_BASE}/item/${encodeURIComponent(
-                    insertImageTarget.id
-                  )}`,
-                  {
-                    method: "PATCH",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      attribute: insertImageTarget.normKey,
-                      value: valueStr,
-                      category: active,
-                    }),
-                  }
-                );
-                if (!res.ok) throw new Error(await res.text());
-                const json = await res.json();
-                const updated = json.updated || null;
-
-                setItems((prev) =>
-                  prev.map((it) =>
-                    it.ID === insertImageTarget.id
-                      ? {
-                          ...it,
-                          [insertImageTarget.normKey]: valueStr,
-                          ...(updated || {}),
-                        }
-                      : it
-                  )
-                );
-                setInsertImageOpen(false);
-              } catch (err) {
-                setModalError({
-                  title: "Insert image failed",
-                  message: err?.message || "Unable to insert image.",
-                });
-              } finally {
-                setUploadingImage(false);
-              }
-            }}
-            disabled={
-              uploadingImage ||
-              (imageUploadMode === "upload" && !imageFile) ||
-              (imageUploadMode === "url" && !imageUrl)
-            }
-            className="px-3 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700"
-          >
-            {uploadingImage ? <Spinner className="h-4 w-4 text-white" /> : null}
-            <span>{uploadingImage ? "Uploading…" : "Insert image"}</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  ) : null;
-
+  
   const imageColumns = useMemo(() => {
     const norm = headerNormalizedOrder();
     const set = new Set();
@@ -1276,9 +1093,9 @@ export default function Viewer() {
       }
     }
     return set;
-  }, [items, schema]);
+  }, [items]);
 
-  // ----------------- Totals + export -----------------
+  // Export helpers
   function computeTotalForItem(item, headerNorms) {
     const excluded = new Set([
       "id",
@@ -1341,7 +1158,6 @@ export default function Viewer() {
     map["total"] = true;
     return map;
   }
-
   function buildRowsForExport(
     itemsArr,
     headerOrig,
@@ -1388,7 +1204,7 @@ export default function Viewer() {
         const normKey = headerNorm[i];
         if (selection[normKey]) {
           const val = colTotals[normKey];
-          totalsRow.push(val === null || val === undefined ? "" : val);
+          totalsRow.push(val == null ? "" : val);
         }
       }
       if (selection["total"]) {
@@ -1533,7 +1349,8 @@ export default function Viewer() {
     }
   }
 
-  function headerCheckboxRow(selection, normArr) {
+  // Header checkbox row
+  function headerCheckboxRow(selection) {
     return (
       <tr>
         <th className="p-1 border-b text-center">
@@ -1554,7 +1371,7 @@ export default function Viewer() {
         </th>
         {headerOriginalOrder().map((h, i) => {
           const protectedCol = isProtectedColumn(h);
-          const normArrLocal = headerNormalizedOrder();
+          const nk = headerNormalizedOrder()[i];
           return (
             <th
               key={`chk-${i}`}
@@ -1564,8 +1381,8 @@ export default function Viewer() {
               <div className="flex items-center justify-center gap-2">
                 <input
                   type="checkbox"
-                  checked={Boolean(selection[normArrLocal[i]])}
-                  onChange={() => toggleColumnForActive(normArrLocal[i])}
+                  checked={Boolean(selection[nk])}
+                  onChange={() => toggleColumnForActive(nk)}
                   className="cursor-pointer"
                 />
                 <button
@@ -1574,7 +1391,7 @@ export default function Viewer() {
                     if (!protectedCol)
                       setPendingDeleteColumn({
                         columnOrig: h,
-                        columnNorm: normArrLocal[i],
+                        columnNorm: nk,
                       });
                   }}
                   title={
@@ -1593,7 +1410,12 @@ export default function Viewer() {
                   {deletingColumn &&
                   pendingDeleteColumn &&
                   pendingDeleteColumn.columnOrig === h ? (
-                    <Spinner className="h-4 w-4 text-red-600" />
+                    <span className="inline-block">
+                      <svg className="animate-spin h-4 w-4 text-red-600" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" strokeWidth="3" />
+                        <path className="opacity-75" d="M4 12a8 8 0 018-8" strokeWidth="3" strokeLinecap="round" />
+                      </svg>
+                    </span>
                   ) : (
                     <Trash2 className="h-4 w-4" />
                   )}
@@ -1614,6 +1436,7 @@ export default function Viewer() {
     );
   }
 
+  // Render table
   function renderTable() {
     if (!items?.length)
       return <div className="text-sm text-gray-500">No items found</div>;
@@ -1627,18 +1450,17 @@ export default function Viewer() {
     return (
       <div className="overflow-auto border border-gray-200 rounded shadow-sm relative">
         <table className="min-w-full table-fixed text-sm">
-          {/* Column widths */}
           <colgroup>
             {Array.from({ length: visualColCount }).map((_, i) => (
               <col
                 key={`col-${i}`}
-                style={{ width: (colWidths[i] || 100) + "px" }}
+                style={{ width: `var(--col-${i}-w, ${(colWidths[i] || 100)}px)` }}
               />
             ))}
           </colgroup>
 
           <thead className="bg-gray-50 sticky top-0 z-10">
-            {headerCheckboxRow(selection, normArr)}
+            {headerCheckboxRow(selection)}
             <tr>
               {/* Sel */}
               <th className="p-2 border-b border-r text-left relative">Sel</th>
@@ -1656,11 +1478,8 @@ export default function Viewer() {
                   onMouseDown={(e) => {
                     e.preventDefault();
                     const idx = 1;
-                    setDraggingCol({
-                      index: idx,
-                      startX: e.clientX,
-                      startWidth: colWidths[idx] || SIZING.defaults.id,
-                    });
+                    const startW = colWidths[idx] || SIZING.defaults.id;
+                    setDraggingCol({ index: idx, startX: e.clientX, startWidth: startW });
                   }}
                   style={{
                     position: "absolute",
@@ -1678,7 +1497,7 @@ export default function Viewer() {
                 const vIdx = 2 + idx;
                 const normKey = normArr[idx] || String(h).toLowerCase();
                 const isImgCol = imageColumns.has(normKey);
-                const imgColHeight = getImageColHeight(normKey);
+                const imgColBaseH = getImageColHeight(normKey);
                 const colWidth = colWidths[vIdx] || SIZING.defaults.data;
 
                 return (
@@ -1692,17 +1511,28 @@ export default function Viewer() {
                       <span>{h}</span>
                       {isImgCol ? (
                         <div className="flex items-center gap-1">
-                          {/* Width & Height controls combined */}
+                          {/* Combined width/height controls; height animated via scaleY */}
                           <button
                             className="px-1 py-0.5 rounded bg-gray-200 hover:bg-gray-300"
                             title="Decrease image/cell size"
                             onClick={(e) => {
                               e.stopPropagation();
-                              setColWidthAt(vIdx, colWidth - STEP.width);
-                              setImageColHeight(
-                                normKey,
-                                imgColHeight - STEP.height
-                              );
+                              const nextW = colWidth - STEP.width;
+                              setCssVar(`--col-${vIdx}-w`, `${Math.max(SIZING.colMin, nextW)}px`);
+
+                              const baseHStr = getComputedStyle(document.documentElement)
+                                .getPropertyValue(`--imgcol-${normKey}-h`).trim();
+                              const baseH = parseInt(baseHStr || `${imgColBaseH}`, 10);
+                              const currentScaleStr = getComputedStyle(document.documentElement)
+                                .getPropertyValue(`--imgcol-${normKey}-scale`).trim();
+                              const currentScale = parseFloat(currentScaleStr || "1") || 1;
+                              const currentH = baseH * currentScale;
+                              const targetH = Math.max(SIZING.rowMin, currentH - STEP.height);
+                              const nextScale = targetH / baseH;
+
+                              setImageColScaleCssVar(normKey, nextScale);       // immediate smooth visual
+                              commitImgColHeightDebounced(normKey, targetH);     // commit base height later
+                              setColWidthAt(vIdx, nextW);                         // persist width now
                             }}
                           >
                             <Minus className="h-3 w-3" />
@@ -1712,11 +1542,22 @@ export default function Viewer() {
                             title="Increase image/cell size"
                             onClick={(e) => {
                               e.stopPropagation();
-                              setColWidthAt(vIdx, colWidth + STEP.width);
-                              setImageColHeight(
-                                normKey,
-                                imgColHeight + STEP.height
-                              );
+                              const nextW = colWidth + STEP.width;
+                              setCssVar(`--col-${vIdx}-w`, `${Math.min(SIZING.colMax, nextW)}px`);
+
+                              const baseHStr = getComputedStyle(document.documentElement)
+                                .getPropertyValue(`--imgcol-${normKey}-h`).trim();
+                              const baseH = parseInt(baseHStr || `${imgColBaseH}`, 10);
+                              const currentScaleStr = getComputedStyle(document.documentElement)
+                                .getPropertyValue(`--imgcol-${normKey}-scale`).trim();
+                              const currentScale = parseFloat(currentScaleStr || "1") || 1;
+                              const currentH = baseH * currentScale;
+                              const targetH = Math.min(SIZING.rowMax, currentH + STEP.height);
+                              const nextScale = targetH / baseH;
+
+                              setImageColScaleCssVar(normKey, nextScale);       // immediate smooth visual
+                              commitImgColHeightDebounced(normKey, targetH);     // commit base height later
+                              setColWidthAt(vIdx, nextW);                         // persist width now
                             }}
                           >
                             <PlusIcon className="h-3 w-3" />
@@ -1762,11 +1603,8 @@ export default function Viewer() {
                   onMouseDown={(e) => {
                     e.preventDefault();
                     const idx = 2 + orig.length;
-                    setDraggingCol({
-                      index: idx,
-                      startX: e.clientX,
-                      startWidth: colWidths[idx] || SIZING.defaults.total,
-                    });
+                    const startW = colWidths[idx] || SIZING.defaults.total;
+                    setDraggingCol({ index: idx, startX: e.clientX, startWidth: startW });
                   }}
                   style={{
                     position: "absolute",
@@ -1829,10 +1667,7 @@ export default function Viewer() {
 
                   {/* ID */}
                   <td className="relative p-2 border-r align-top font-mono text-xs bg-gray-100 group-hover:bg-blue-50">
-                    <div
-                      className="truncate"
-                      style={{ maxHeight: contentMaxH }}
-                    >
+                    <div className="truncate" style={{ maxHeight: contentMaxH }}>
                       {it.ID}
                     </div>
                   </td>
@@ -1849,30 +1684,26 @@ export default function Viewer() {
                     const savingKey = `${it.ID}|${nkey}`;
 
                     const visualIdx = 2 + colIndex;
-                    const cellWidth = Math.max(
+                    const cellWidthVar = `var(--col-${visualIdx}-w, ${
+                      (getColWidths()[visualIdx] || SIZING.defaults.data)
+                    }px)`;
+                    const cellWidth =
+                      (getColWidths()[visualIdx] || SIZING.defaults.data) - CELL_PADDING * 2;
+
+                    const isImgCol = imageColumns.has(nkey);
+                    const imgColHeightVar = `var(--imgcol-${nkey}-h, ${SIZING.defaults.imageColHeight}px)`;
+                    const imgColScaleVar = `var(--imgcol-${nkey}-scale, 1)`;
+
+                    const textCellHeight = Math.max(
                       0,
-                      (colWidths[visualIdx] || SIZING.defaults.data) -
-                        CELL_PADDING * 2
+                      getRowHeightById(it.ID) - CELL_PADDING * 2
                     );
-
-                    // If column is an image column, use its configured height, else fall back to row-based contentMaxH
-                    const imgColumnHeight = imageColumns.has(nkey)
-                      ? Math.max(
-                          SIZING.rowMin,
-                          getImageColHeight(nkey) - CELL_PADDING * 2
-                        )
-                      : contentMaxH;
-
-                    const cellHeight = imgColumnHeight;
-
-                    // Always auto width/height: fill the cell box while preserving aspect ratio
-                    const desiredW = cellWidth;
-                    const desiredH = cellHeight;
 
                     return (
                       <td
                         key={nkey}
-                        className="relative p-2 border-r align-top whitespace-nowrap overflow-hidden"
+                        className="relative p-2 border-r align-top overflow-hidden"
+                        style={{ width: cellWidthVar }}
                         onDoubleClick={() => startEdit(it.ID, nkey, value)}
                         onContextMenu={(e) =>
                           onBodyCellContextMenu(e, rowIdx, it.ID, nkey)
@@ -1883,22 +1714,36 @@ export default function Viewer() {
                           <div
                             className="text-xs flex items-center gap-2"
                             style={{
-                              maxHeight: cellHeight,
+                              width: "100%",
+                              maxHeight: isImgCol ? imgColHeightVar : textCellHeight,
                               overflow: "hidden",
                             }}
                           >
                             {imgObj ? (
-                              <img
-                                src={imgObj.src}
-                                alt={imgObj.alt || h}
+                              <div
+                                className="img-box"
                                 style={{
-                                  width: desiredW,
-                                  height: desiredH,
-                                  objectFit: "contain",
-                                  borderRadius: 4,
-                                  display: "block",
+                                  width: "100%",
+                                  height: imgColHeightVar,
+                                  transformOrigin: "top",
+                                  transform: `scaleY(${imgColScaleVar})`,
+                                  willChange: "transform",
+                                  contain: "layout paint",
                                 }}
-                              />
+                              >
+                                <img
+                                  src={imgObj.src}
+                                  alt={imgObj.alt || h}
+                                  decoding="async"
+                                  loading="lazy"
+                                  style={{
+                                    maxWidth: "100%",
+                                    maxHeight: "100%",
+                                    objectFit: "contain",
+                                    display: "block",
+                                  }}
+                                />
+                              </div>
                             ) : savingCellKey === savingKey ? (
                               <span className="text-indigo-600">Saving…</span>
                             ) : value === undefined || value === null ? (
@@ -1908,7 +1753,7 @@ export default function Viewer() {
                                 className="truncate"
                                 style={{
                                   maxWidth: cellWidth,
-                                  maxHeight: cellHeight,
+                                  maxHeight: textCellHeight,
                                 }}
                               >
                                 {String(value)}
@@ -1933,7 +1778,6 @@ export default function Viewer() {
                               if (incoming === original) {
                                 cancelEdit();
                               } else {
-                                // Save plain text to the cell (overwrites image JSON if present)
                                 saveEdit(it.ID, nkey, cellValue);
                               }
                             }}
@@ -2027,10 +1871,7 @@ export default function Viewer() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(txt || `Server ${res.status}`);
-      }
+      if (!res.ok) throw new Error(await res.text());
       const json = await res.json();
       setItems((prev) =>
         prev.map((it) =>
@@ -2068,7 +1909,7 @@ export default function Viewer() {
     } else if (e.key === "Escape") cancelEdit();
   }
 
-  // ----------------- Small header controls -----------------
+  // Header controls
   function headerControls() {
     return (
       <div className="flex gap-2 items-center">
@@ -2162,6 +2003,222 @@ export default function Viewer() {
   }
 
   // ----------------- Modals -----------------
+  const InsertImageModal = insertImageOpen ? (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={() => !uploadingImage && setInsertImageOpen(false)}
+    >
+      <div
+        className="bg-white rounded-lg shadow-lg p-6 max-w-lg w-full"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="text-lg font-semibold mb-2">Insert image</h3>
+        <p className="text-sm text-gray-700 mb-4">
+          Set image for item <strong>{insertImageTarget?.id}</strong>, column{" "}
+          <strong>{insertImageTarget?.normKey}</strong>.
+        </p>
+
+        <div className="mb-3">
+          <div className="flex gap-2">
+            <button
+              className={`px-3 py-1 rounded ${
+                imageUploadMode === "upload"
+                  ? "bg-indigo-600 text-white"
+                  : "bg-gray-200"
+              }`}
+              onClick={() => setImageUploadMode("upload")}
+              disabled={uploadingImage}
+            >
+              Upload file
+            </button>
+            <button
+              className={`px-3 py-1 rounded ${
+                imageUploadMode === "url"
+                  ? "bg-indigo-600 text-white"
+                  : "bg-gray-200"
+              }`}
+              onClick={() => setImageUploadMode("url")}
+              disabled={uploadingImage}
+            >
+              Paste URL
+            </button>
+          </div>
+        </div>
+
+        {imageUploadMode === "upload" ? (
+          <div className="mb-3">
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => {
+                const f = e.target.files?.[0] ?? null;
+                setImageFile(f);
+                setImagePreviewUrl(f ? URL.createObjectURL(f) : "");
+              }}
+            />
+          </div>
+        ) : (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Image URL</label>
+            <input
+              className="w-full border rounded px-2 py-2"
+              placeholder="https://example.com/image.jpg"
+              value={imageUrl}
+              onChange={(e) => {
+                setImageUrl(e.target.value);
+                setImagePreviewUrl(e.target.value);
+              }}
+            />
+          </div>
+        )}
+
+        <div className="mb-3">
+          <label className="block text-sm font-medium mb-1">
+            Alt text (optional)
+          </label>
+          <input
+            className="w-full border rounded px-2 py-2"
+            placeholder="Description"
+            value={imageAlt}
+            onChange={(e) => setImageAlt(e.target.value)}
+          />
+        </div>
+
+        {imagePreviewUrl ? (
+          <div className="mb-4">
+            <div className="text-xs text-gray-600 mb-1">Preview</div>
+            <div
+              className="border rounded p-2 flex items-center justify-center"
+              style={{ maxHeight: 240 }}
+            >
+              <img
+                src={imagePreviewUrl}
+                alt={imageAlt || "preview"}
+                decoding="async"
+                loading="lazy"
+                style={{
+                  maxWidth: "100%",
+                  maxHeight: "220px",
+                  objectFit: "contain",
+                }}
+              />
+            </div>
+          </div>
+        ) : null}
+
+        <div className="flex gap-2 justify-end">
+          <button
+            onClick={() => setInsertImageOpen(false)}
+            className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={async () => {
+              if (
+                !insertImageTarget?.id ||
+                !insertImageTarget?.normKey ||
+                !active
+              )
+                return;
+              setUploadingImage(true);
+              try {
+                let finalUrl = "";
+                let s3Key = "";
+                if (imageUploadMode === "upload") {
+                  if (!imageFile)
+                    throw new Error("Please choose an image file.");
+                  const contentType =
+                    imageFile.type || "application/octet-stream";
+                  const meta = {
+                    category: active,
+                    itemId: insertImageTarget.id,
+                    column: insertImageTarget.normKey,
+                  };
+                  const presigned = await presignUpload(
+                    imageFile.name,
+                    contentType,
+                    meta
+                  );
+                  const putRes = await fetch(presigned.uploadUrl, {
+                    method: "PUT",
+                    headers: { "Content-Type": contentType },
+                    body: imageFile,
+                  });
+                  if (!putRes.ok) throw new Error(await putRes.text());
+                  finalUrl = presigned.finalUrl || "";
+                  s3Key = presigned.s3Key || "";
+                } else {
+                  if (!imageUrl || !/^https?:\/\//i.test(imageUrl))
+                    throw new Error("Please enter a valid image URL.");
+                  finalUrl = imageUrl.trim();
+                }
+
+                // Always auto width/height for images
+                const payload = {
+                  type: "image",
+                  src: finalUrl,
+                  alt: imageAlt || "",
+                  width: "auto",
+                  height: "auto",
+                  ...(s3Key ? { s3Key } : {}),
+                };
+                const valueStr = JSON.stringify(payload);
+
+                const res = await fetch(
+                  `${API_BASE}/item/${encodeURIComponent(
+                    insertImageTarget.id
+                  )}`,
+                  {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      attribute: insertImageTarget.normKey,
+                      value: valueStr,
+                      category: active,
+                    }),
+                  }
+                );
+                if (!res.ok) throw new Error(await res.text());
+                const json = await res.json();
+                const updated = json.updated || null;
+
+                setItems((prev) =>
+                  prev.map((it) =>
+                    it.ID === insertImageTarget.id
+                      ? {
+                          ...it,
+                          [insertImageTarget.normKey]: valueStr,
+                          ...(updated || {}),
+                        }
+                      : it
+                  )
+                );
+                setInsertImageOpen(false);
+              } catch (err) {
+                setModalError({
+                  title: "Insert image failed",
+                  message: err?.message || "Unable to insert image.",
+                });
+              } finally {
+                setUploadingImage(false);
+              }
+            }}
+            disabled={
+              uploadingImage ||
+              (imageUploadMode === "upload" && !imageFile) ||
+              (imageUploadMode === "url" && !imageUrl)
+            }
+            className="px-3 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700"
+          >
+            {uploadingImage ? <Spinner className="h-4 w-4 text-white" /> : null}
+            <span>{uploadingImage ? "Uploading…" : "Insert image"}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   const InsertColumnModal = insertColumnOpen ? (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
@@ -2308,7 +2365,7 @@ export default function Viewer() {
     </div>
   ) : null;
 
-  // ----------------- JSX -----------------
+  // JSX
   return (
     <div className="max-w-7xl mx-auto p-4">
       <header className="mb-6 flex items-start justify-between">
@@ -2316,11 +2373,9 @@ export default function Viewer() {
           <h1 className="text-2xl font-semibold">Inventory Viewer</h1>
           <p className="text-sm text-gray-500 mt-1">
             Right-click headers to Add column (left/right). Right-click a data
-            cell to Add row (top/bottom), Delete row, or Insert image. Drag
-            header edges to resize columns, and drag the small bar under the
-            left cell of a row to resize height. Image columns show +/- controls
-            in header to adjust both column width and image height for all cells
-            in that column. Images always auto-fit to the cell.
+            cell to Add row (top/bottom), Delete row, or Insert image.
+            Drag header edges to resize columns, and drag the small bar under the left cell of a row to resize height.
+            Image columns show +/- controls; width changes are immediate, height changes animate smoothly.
           </p>
         </div>
         {headerControls()}
@@ -2372,21 +2427,21 @@ export default function Viewer() {
           <h2 className="text-lg font-medium mb-2">
             {active || "No category selected"}
           </h2>
+          {loadingItems ? (
+            <div className="text-sm text-gray-500">Loading items...</div>
+          ) : (
+            renderTable()
+          )}
+
+          {/* Modals */}
+          {InsertColumnModal}
+          {InsertRowModal}
+          {InsertImageModal}
+
+          {/* Context menus */}
+          <ColumnContextMenu />
+          <RowContextMenu />
         </div>
-        {loadingItems ? (
-          <div className="text-sm text-gray-500">Loading items...</div>
-        ) : (
-          renderTable()
-        )}
-
-        {/* Modals */}
-        {InsertColumnModal}
-        {InsertRowModal}
-        {InsertImageModal}
-
-        {/* Context menus */}
-        <ColumnContextMenu />
-        <RowContextMenu />
       </main>
 
       {/* Delete Column Modal */}
@@ -2493,9 +2548,12 @@ export default function Viewer() {
   );
 }
 
-// Utilities used above
-function norm(s) {
-  return String(s || "")
-    .trim()
-    .toLowerCase();
+// Tiny inline spinner component (used above)
+function Spinner({ className = "h-4 w-4 text-white" }) {
+  return (
+    <svg className={`animate-spin ${className}`} viewBox="0 0 24 24" fill="none" stroke="currentColor">
+      <circle className="opacity-25" cx="12" cy="12" r="10" strokeWidth="3" />
+      <path className="opacity-75" d="M4 12a8 8 0 018-8" strokeWidth="3" strokeLinecap="round" />
+    </svg>
+  );
 }
